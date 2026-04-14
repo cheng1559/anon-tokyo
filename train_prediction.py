@@ -7,7 +7,7 @@ from anon_tokyo.prediction.lit_module import PredictionModule
 
 
 def main() -> None:
-    LightningCLI(PredictionModule, WOMDDataModule)
+    LightningCLI(PredictionModule, WOMDDataModule, save_config_kwargs={"overwrite": True})
 
 
 if __name__ == "__main__":

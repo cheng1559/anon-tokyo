@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "AnonTokyo: Multi-Agent Interaction Modelling with RoPE/DRoPE"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.6",
+    "torch>=2.7",
     "lightning>=2.4",
     "jsonargparse[signatures]>=4.27",
     "tensorboard>=2.16",
@@ -14,13 +14,13 @@ dependencies = [
 ]
 
 [tool.uv]
-# Driver 535 supports CUDA 12.8; use PyTorch cu124 wheels
+# Driver 535 supports CUDA 12.8; use PyTorch cu128 wheels
 [[tool.uv.index]]
-url = "https://download.pytorch.org/whl/cu124"
-name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu128"
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu128" }
 
 [project.optional-dependencies]
 # NOTE: scripts/ (preprocess_womd.py) requires tensorflow + waymo-open-dataset-tf
