@@ -5,25 +5,26 @@ trainer:
   max_epochs: 30
   precision: bf16-mixed
   strategy: ddp
-  devices: 8
+  devices: 1
   logger:
     class_path: lightning.pytorch.loggers.TensorBoardLogger
     init_args:
       save_dir: tb_logs
       name: prediction_mtr
+  gradient_clip_val: 1000.0
+  log_every_n_steps: 10
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        monitor: val/mAP
-        mode: max
+        monitor: val/loss/total
+        mode: min
         save_top_k: 3
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
 
 model:
-  class_path: anon_tokyo.prediction.lit_module.PredictionModule
-  init_args:
-    model_class: anon_tokyo.prediction.mtr.model.MTRModel
-    model_kwargs:
+  model:
+    class_path: anon_tokyo.prediction.mtr.model.MTRModel
+    init_args:
       d_model: 256
       num_encoder_layers: 6
       num_decoder_layers: 6
@@ -32,20 +33,22 @@ model:
       num_modes: 6
       num_intention_queries: 64
       num_future_frames: 80
-    optimizer_class: torch.optim.AdamW
-    optimizer_kwargs:
-      lr: 1.0e-4
-      weight_decay: 0.01
-    loss_weights:
-      reg: 1.0
-      score: 1.0
-      vel: 0.2
+      intention_points_file: data/intention_points.pkl
+  optimizer_class: torch.optim.AdamW
+  optimizer_kwargs:
+    lr: 1.0e-4
+    weight_decay: 0.01
+  scheduler_kwargs:
+    warmup_ratio: 0.2
+    eta_min: 1.0e-6
+  loss_weights:
+    reg: 1.0
+    score: 1.0
+    vel: 0.2
 
 data:
-  class_path: anon_tokyo.data.datamodule.WOMDDataModule
-  init_args:
-    data_root: data/shards
-    batch_size: 16
-    num_workers: 8
-    max_agents: 128
-    max_polylines: 4096
+  data_root: data/shards
+  batch_size: 16
+  num_workers: 8
+  max_agents: 128
+  max_polylines: 4096

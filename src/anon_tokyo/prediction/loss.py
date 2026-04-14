@@ -182,3 +182,170 @@ def prediction_loss(
         "loss/vel": loss_vel_mean.detach(),
         "loss/total": total.detach(),
     }
+
+
+# ── MTR agent-centric loss ───────────────────────────────────────────────────
+
+
+def _nll_loss_gmm_flat(
+    pred_trajs: Tensor,
+    gt_trajs: Tensor,
+    gt_mask: Tensor,
+    *,
+    log_std_range: tuple[float, float] = (-1.609, 5.0),
+    rho_limit: float = 0.5,
+    pre_winner_idx: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """GMM NLL for ``[N, M, T, 5]`` format (no B×K dims).
+
+    Args:
+        pred_trajs:  ``[N, M, T, 5]`` — (μx, μy, log_σ1, log_σ2, ρ).
+        gt_trajs:    ``[N, T, 2]``.
+        gt_mask:     ``[N, T]``.
+        pre_winner_idx: optional ``[N]`` — if given, use as initial WTA.
+
+    Returns:
+        reg_loss ``[N]``, winner_idx ``[N]``.
+    """
+    N, M, T, _ = pred_trajs.shape
+
+    pred_xy = pred_trajs[:, :, :, 0:2]  # [N, M, T, 2]
+    gt_xy = gt_trajs[:, None, :, :]  # [N, 1, T, 2]
+    dist = (pred_xy - gt_xy).norm(dim=-1) * gt_mask[:, None, :]
+    total_dist = dist.sum(dim=-1)  # [N, M]
+
+    if pre_winner_idx is not None:
+        winner_idx = pre_winner_idx
+    else:
+        winner_idx = total_dist.argmin(dim=-1)
+
+    n_idx = torch.arange(N, device=pred_trajs.device)
+    winner_trajs = pred_trajs[n_idx, winner_idx]  # [N, T, 5]
+
+    dx = gt_trajs[:, :, 0] - winner_trajs[:, :, 0]
+    dy = gt_trajs[:, :, 1] - winner_trajs[:, :, 1]
+    log_std1 = winner_trajs[:, :, 2].clamp(*log_std_range)
+    log_std2 = winner_trajs[:, :, 3].clamp(*log_std_range)
+    rho = winner_trajs[:, :, 4].clamp(-rho_limit, rho_limit)
+
+    std1 = log_std1.exp()
+    std2 = log_std2.exp()
+    one_minus_rho2 = (1 - rho * rho).clamp(min=1e-6)
+
+    log_coeff = log_std1 + log_std2 + 0.5 * one_minus_rho2.log()
+    z = dx * dx / (std1 * std1) + dy * dy / (std2 * std2) - 2 * rho * dx * dy / (std1 * std2)
+    nll = log_coeff + 0.5 * z / one_minus_rho2
+
+    valid_count = gt_mask.sum(dim=-1).clamp(min=1)
+    reg_loss = (nll * gt_mask).sum(dim=-1) / valid_count
+
+    return reg_loss, winner_idx
+
+
+def mtr_prediction_loss(
+    output: dict[str, Tensor],
+    loss_weights: dict[str, float],
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """MTR per-layer loss + dense future prediction auxiliary loss.
+
+    Expects agent-centric output from MTRModel:
+        ``pred_list``: list of ``(scores [K, Q], trajs [K, Q, T, 7])`` per layer
+        ``pred_dense_trajs``: ``[K, A, T, 7]``
+        ``intention_points``: ``[K, Q, 2]``
+        ``center_gt_trajs``: ``[K, T, 4]`` (x, y, vx, vy)
+        ``center_gt_mask``: ``[K, T]``
+        ``obj_trajs_future``: ``[K, A, T, 4]``
+        ``obj_trajs_future_mask``: ``[K, A, T]``
+    """
+    pred_list = output["pred_list"]
+    intention_points = output["intention_points"]  # [K, Q, 2]
+    center_gt = output["center_gt_trajs"]  # [K, T, 4]
+    center_mask = output["center_gt_mask"]  # [K, T]
+    K = center_gt.shape[0]
+
+    # Find last valid frame for intention-point matching
+    gt_xy = center_gt[:, :, 0:2]
+    idx_range = torch.arange(center_mask.shape[1], device=center_mask.device)
+    last_valid = (idx_range[None, :] * center_mask).max(dim=-1).values.long().clamp(min=0)
+    gt_goals = gt_xy[torch.arange(K, device=gt_xy.device), last_valid]  # [K, 2]
+
+    # Nearest intention point as positive index
+    ip_dist = (gt_goals[:, None, :] - intention_points).norm(dim=-1)  # [K, Q]
+    positive_idx = ip_dist.argmin(dim=-1)  # [K]
+
+    w_reg = loss_weights.get("reg", 1.0)
+    w_cls = loss_weights.get("score", 1.0)
+    w_vel = loss_weights.get("vel", 0.2)
+
+    loss_dict: dict[str, Tensor] = {}
+    total_decoder_loss = gt_xy.new_tensor(0.0)
+    num_layers = len(pred_list)
+
+    for i, (scores, trajs) in enumerate(pred_list):
+        # scores: [K, Q], trajs: [K, Q, T, 7]
+        pred_gmm = trajs[:, :, :, 0:5]
+        pred_vel = trajs[:, :, :, 5:7]
+
+        loss_reg, positive_idx = _nll_loss_gmm_flat(
+            pred_gmm,
+            gt_xy,
+            center_mask,
+            pre_winner_idx=positive_idx,
+        )
+
+        # Velocity loss on winner mode
+        n_idx = torch.arange(K, device=trajs.device)
+        winner_vel = pred_vel[n_idx, positive_idx]  # [K, T, 2]
+        gt_vel = center_gt[:, :, 2:4]
+        vel_l1 = (winner_vel - gt_vel).abs().sum(dim=-1)
+        valid_count = center_mask.sum(dim=-1).clamp(min=1)
+        loss_vel = (vel_l1 * center_mask).sum(dim=-1) / valid_count
+
+        # Classification loss
+        loss_cls = F.cross_entropy(scores, positive_idx, reduction="none")
+
+        layer_loss = (w_reg * loss_reg + w_vel * loss_vel + w_cls * loss_cls).mean()
+        total_decoder_loss = total_decoder_loss + layer_loss
+        loss_dict[f"loss/layer{i}"] = layer_loss.detach()
+
+    total_decoder_loss = total_decoder_loss / num_layers
+
+    # Dense future prediction loss
+    dense_loss = _dense_future_loss(output)
+
+    total = total_decoder_loss + dense_loss
+    loss_dict["loss/decoder"] = total_decoder_loss.detach()
+    loss_dict["loss/dense"] = dense_loss.detach()
+    loss_dict["loss/total"] = total.detach()
+    return total, loss_dict
+
+
+def _dense_future_loss(output: dict[str, Tensor]) -> Tensor:
+    """Auxiliary L1 + GMM loss on all agents' dense future predictions."""
+    pred_dense = output["pred_dense_trajs"]  # [K, A, T, 7]
+    gt_future = output["obj_trajs_future"]  # [K, A, T, 4]
+    gt_mask = output["obj_trajs_future_mask"]  # [K, A, T]
+
+    K, A, T, _ = pred_dense.shape
+    pred_gmm = pred_dense[:, :, :, 0:5]
+    pred_vel = pred_dense[:, :, :, 5:7]
+    gt_xy = gt_future[:, :, :, 0:2]
+    gt_vel = gt_future[:, :, :, 2:4]
+
+    # Velocity L1
+    vel_l1 = (pred_vel - gt_vel).abs().sum(dim=-1)  # [K, A, T]
+    vel_l1 = (vel_l1 * gt_mask).sum(dim=-1)  # [K, A]
+
+    # GMM NLL (single mode)
+    flat_pred = pred_gmm.view(K * A, 1, T, 5)
+    flat_gt = gt_xy.view(K * A, T, 2)
+    flat_mask = gt_mask.view(K * A, T)
+    fake_idx = torch.zeros(K * A, device=pred_dense.device, dtype=torch.long)
+    reg_loss, _ = _nll_loss_gmm_flat(flat_pred, flat_gt, flat_mask, pre_winner_idx=fake_idx)
+    reg_loss = reg_loss.view(K, A)
+
+    loss_per_agent = vel_l1 + reg_loss
+    agent_valid = gt_mask.sum(dim=-1) > 0  # [K, A]
+    loss_per_sample = (loss_per_agent * agent_valid.float()).sum(dim=-1) / agent_valid.sum(dim=-1).clamp(min=1)
+
+    return loss_per_sample.mean()

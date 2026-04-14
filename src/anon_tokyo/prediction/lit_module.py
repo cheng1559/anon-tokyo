@@ -2,39 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 import lightning as L
 import torch
+import torch.nn as nn
 from torch import Tensor
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from anon_tokyo.prediction.loss import prediction_loss
+from anon_tokyo.prediction.loss import mtr_prediction_loss, prediction_loss
 from anon_tokyo.prediction.metrics import compute_prediction_metrics
-
-
-@runtime_checkable
-class PredictionModel(Protocol):
-    """Interface that concrete prediction models must implement."""
-
-    def __call__(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Forward pass.
-
-        Returns:
-            ``pred_trajs``: ``[B, K, num_modes, T, 7]``
-                (μx, μy, log_σ1, log_σ2, ρ, vx, vy) in agent-local frame.
-            ``pred_scores``: ``[B, K, num_modes]`` — raw logits.
-        """
-        ...
-
-
-def _import_class(dotpath: str) -> type:
-    """Import a class from a dotted path like ``pkg.module.ClassName``."""
-    module_path, _, class_name = dotpath.rpartition(".")
-    import importlib
-
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
 
 
 class PredictionModule(L.LightningModule):
@@ -42,25 +19,17 @@ class PredictionModule(L.LightningModule):
 
     def __init__(
         self,
-        model_class: str,
-        model_kwargs: dict[str, Any] | None = None,
+        model: nn.Module,
         optimizer_class: str = "torch.optim.AdamW",
         optimizer_kwargs: dict[str, Any] | None = None,
         scheduler_kwargs: dict[str, Any] | None = None,
         loss_weights: dict[str, float] | None = None,
-        intention_points_file: str | None = None,
         compile_model: bool = False,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["model"])
 
-        # Build model
-        mk = dict(model_kwargs or {})
-        if intention_points_file is not None:
-            mk["intention_points_file"] = intention_points_file
-        cls = _import_class(model_class)
-        self.model = cls(**mk)
-
+        self.model = model
         if compile_model:
             self.model = torch.compile(self.model, mode="reduce-overhead")
 
@@ -74,58 +43,109 @@ class PredictionModule(L.LightningModule):
 
     # ── Training ──────────────────────────────────────────────────────────
 
+    def _is_agent_centric(self, output: dict[str, Tensor]) -> bool:
+        return "pred_list" in output
+
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         output = self.model(batch)
-        total_loss, loss_dict = prediction_loss(output, batch, self.loss_weights)
+
+        if self._is_agent_centric(output):
+            total_loss, loss_dict = mtr_prediction_loss(output, self.loss_weights)
+            bs = output["center_gt_trajs"].shape[0]
+        else:
+            total_loss, loss_dict = prediction_loss(output, batch, self.loss_weights)
+            bs = batch["obj_trajs"].shape[0]
+
         self.log_dict(
             {f"train/{k}": v for k, v in loss_dict.items()},
             on_step=True,
             on_epoch=False,
-            prog_bar=True,
-            batch_size=batch["obj_trajs"].shape[0],
+            prog_bar=False,
+            batch_size=bs,
         )
+        self.log("train/loss", loss_dict["loss/total"], prog_bar=True, batch_size=bs)
         return total_loss
 
     # ── Validation ────────────────────────────────────────────────────────
 
     def validation_step(self, batch: dict[str, Tensor], batch_idx: int) -> None:
         output = self.model(batch)
-        _, loss_dict = prediction_loss(output, batch, self.loss_weights)
-        self.log_dict(
-            {f"val/{k}": v for k, v in loss_dict.items()},
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch["obj_trajs"].shape[0],
-        )
 
-        # Metrics over tracks_to_predict
-        B = output["pred_trajs"].shape[0]
-        K = output["pred_trajs"].shape[1]
-        ttp = batch["tracks_to_predict"]
-        ttp_clamped = ttp.clamp(min=0)
-
-        b_idx = torch.arange(B, device=ttp.device)[:, None].expand(B, K)
-        gt_local = batch["obj_trajs_future_local"][b_idx, ttp_clamped[:, :K]]
-        gt_mask = batch["obj_trajs_future_mask"][b_idx, ttp_clamped[:, :K]]
-
-        pred_xy = output["pred_trajs"][:, :, :, :, 0:2]
-        metrics = compute_prediction_metrics(pred_xy, output["pred_scores"], gt_local[:, :, :, 0:2], gt_mask)
-
-        ttp_valid = (ttp[:, :K] >= 0).float()
-        valid_count = ttp_valid.sum().clamp(min=1)
-        for name, val in metrics.items():
-            self.log(
-                f"val/{name}",
-                (val * ttp_valid).sum() / valid_count,
+        if self._is_agent_centric(output):
+            _, loss_dict = mtr_prediction_loss(output, self.loss_weights)
+            bs = output["center_gt_trajs"].shape[0]
+            self.log_dict(
+                {f"val/{k}": v for k, v in loss_dict.items()},
                 on_epoch=True,
                 sync_dist=True,
-                batch_size=B,
+                batch_size=bs,
             )
+
+            # Metrics: use final layer predictions
+            pred_trajs = output["pred_trajs"]  # [K, M, T, 7]
+            pred_scores = output["pred_scores"]  # [K, M]
+            center_gt = output["center_gt_trajs"]  # [K, T, 4]
+            center_mask = output["center_gt_mask"]  # [K, T]
+
+            # Add dummy K (agents) dim → [K, 1, M, T, 2] / [K, 1, M]
+            pred_xy = pred_trajs[:, :, :, 0:2].unsqueeze(1)
+            scores = pred_scores.unsqueeze(1)
+            gt_xy = center_gt[:, :, 0:2].unsqueeze(1)
+            mask = center_mask.unsqueeze(1)
+
+            metrics = compute_prediction_metrics(pred_xy, scores, gt_xy, mask)
+            for name, val in metrics.items():
+                self.log(
+                    f"val/{name}",
+                    val.mean(),
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=bs,
+                )
+        else:
+            _, loss_dict = prediction_loss(output, batch, self.loss_weights)
+            self.log_dict(
+                {f"val/{k}": v for k, v in loss_dict.items()},
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch["obj_trajs"].shape[0],
+            )
+
+            B = output["pred_trajs"].shape[0]
+            K = output["pred_trajs"].shape[1]
+            ttp = batch["tracks_to_predict"]
+            ttp_clamped = ttp.clamp(min=0)
+
+            b_idx = torch.arange(B, device=ttp.device)[:, None].expand(B, K)
+            gt_local = batch["obj_trajs_future_local"][b_idx, ttp_clamped[:, :K]]
+            gt_mask = batch["obj_trajs_future_mask"][b_idx, ttp_clamped[:, :K]]
+
+            pred_xy = output["pred_trajs"][:, :, :, :, 0:2]
+            metrics = compute_prediction_metrics(
+                pred_xy,
+                output["pred_scores"],
+                gt_local[:, :, :, 0:2],
+                gt_mask,
+            )
+
+            ttp_valid = (ttp[:, :K] >= 0).float()
+            valid_count = ttp_valid.sum().clamp(min=1)
+            for name, val in metrics.items():
+                self.log(
+                    f"val/{name}",
+                    (val * ttp_valid).sum() / valid_count,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=B,
+                )
 
     # ── Optimizer / Scheduler ─────────────────────────────────────────────
 
     def configure_optimizers(self) -> dict[str, Any]:
-        opt_cls = _import_class(self._optimizer_class)
+        module_path, _, cls_name = self._optimizer_class.rpartition(".")
+        import importlib
+
+        opt_cls = getattr(importlib.import_module(module_path), cls_name)
         optimizer = opt_cls(self.parameters(), **self._optimizer_kwargs)
 
         sk = self._scheduler_kwargs
@@ -140,7 +160,7 @@ class PredictionModule(L.LightningModule):
         )
         cosine = CosineAnnealingLR(
             optimizer,
-            T_max=total_steps - warmup_steps,
+            T_max=max(total_steps - warmup_steps, 1),
             eta_min=sk.get("eta_min", 1e-6),
         )
         scheduler = SequentialLR(
