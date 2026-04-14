@@ -39,10 +39,16 @@ model:
     optimizer_kwargs:
       lr: 1.0e-4
       weight_decay: 0.01
+    scheduler_kwargs:
+      warmup_ratio: 0.1
+      start_factor: 0.1
+      eta_min: 1.0e-6
     loss_weights:
       reg: 1.0
       score: 1.0
       vel: 0.2
+    intention_points_file: data/intention_points.pkl
+    compile_model: false
 
 data:
   class_path: anon_tokyo.data.datamodule.WOMDDataModule

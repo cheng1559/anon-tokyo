@@ -14,6 +14,7 @@ uv.lock
 data/raw
 data/processed
 data/shards
+data/intention_points.pkl
 
 # Training outputs
 outputs/
