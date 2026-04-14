@@ -1,9 +1,10 @@
 """MTR decoder: intention-query based multi-modal trajectory prediction.
 
-Follows the official MTR architecture but replaces the custom
-``TransformerDecoderLayer`` with standard ``nn.MultiheadAttention`` and
-drops the custom CUDA local-attention op in favour of global cross-attention
-on dynamically-collected map polylines.
+Matches the official MTR architecture:
+- Concatenative PE cross-attention (Q/K doubled to 2*d_model)
+- Separate obj and map cross-attention with separate query results
+- Dynamic map collection with local cross-attention
+- Per-layer prediction heads with waypoint update
 """
 
 from __future__ import annotations
@@ -19,92 +20,107 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from anon_tokyo.nn.layers import build_mlps
+from anon_tokyo.prediction.mtr.encoder import gen_sineembed_for_position
 
 
-# ── Positional encoding ──────────────────────────────────────────────────────
-
-
-def _gen_sineembed_for_position(pos: Tensor, hidden_dim: int = 256) -> Tensor:
-    """Sinusoidal positional encoding for 2-D coordinates (DAB-DETR style).
-
-    Args:
-        pos: ``[..., 2]`` — (x, y).
-        hidden_dim: output dimension; must be divisible by 2.
-
-    Returns:
-        ``[..., hidden_dim]``
-    """
-    half = hidden_dim // 2
-    dim_t = torch.arange(half, dtype=torch.float32, device=pos.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / half)
-
-    x_emb = pos[..., 0:1] / dim_t  # [..., half]
-    y_emb = pos[..., 1:2] / dim_t
-    pe = torch.cat([x_emb.sin(), x_emb.cos(), y_emb.sin(), y_emb.cos()], dim=-1)
-    return pe[..., :hidden_dim]
-
-
-# ── Single decoder layer ─────────────────────────────────────────────────────
+# ── Single decoder layer (cross-attn only, matching official TransformerDecoderLayer) ────
 
 
 class MTRDecoderLayer(nn.Module):
-    """Self-attn → cross-attn (agent) → cross-attn (map) → FFN."""
+    """Cross-attention decoder layer with additive PE.
 
-    def __init__(self, d_model: int, nhead: int, dim_ff: int, dropout: float = 0.1) -> None:
+    Q = content + sine_embed (+ pos on first layer)
+    K = content + k_pos
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+
+        # Self-attention
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
         self.norm_sa = nn.LayerNorm(d_model)
-        self.drop_sa = nn.Dropout(dropout)
+        self.dropout_sa = nn.Dropout(dropout)
 
-        self.cross_attn_obj = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
-        self.norm_obj = nn.LayerNorm(d_model)
-        self.drop_obj = nn.Dropout(dropout)
+        # Cross-attention projection layers
+        self.ca_qcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_kcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_kpos_proj = nn.Linear(d_model, d_model)
+        self.ca_v_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
 
-        self.cross_attn_map = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
-        self.norm_map = nn.LayerNorm(d_model)
-        self.drop_map = nn.Dropout(dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_ff),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_ff, d_model),
+        # Standard MHA cross-attention (d_model, no dim doubling)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=False,
         )
+        self.norm_ca = nn.LayerNorm(d_model)
+        self.dropout_ca = nn.Dropout(dropout)
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
         self.norm_ffn = nn.LayerNorm(d_model)
-        self.drop_ffn = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
     def forward(
         self,
-        query: Tensor,  # [Q, K_total, D]
+        tgt: Tensor,  # [Q, K_total, D]
         query_pos: Tensor,  # [Q, K_total, D]
-        obj_kv: Tensor,  # [A, K_total, D]
-        obj_kv_pos: Tensor,  # [A, K_total, D]
-        obj_kv_mask: Tensor,  # [K_total, A]  True = padding
-        map_kv: Tensor,  # [M', K_total, D]
-        map_kv_pos: Tensor,  # [M', K_total, D]
-        map_kv_mask: Tensor,  # [K_total, M']  True = padding
+        query_sine_embed: Tensor,  # [Q, K_total, D] — sine embed from dynamic center
+        memory: Tensor,  # [S, K_total, D]
+        pos: Tensor,  # [S, K_total, D] — memory positional encoding
+        memory_key_padding_mask: Tensor | None = None,  # [K_total, S]
+        query_pos_projected: Tensor | None = None,  # [Q, K_total, D] pre-projected (first layer only)
     ) -> Tensor:
-        # Self-attention among intention queries
-        q = k = query + query_pos
-        sa_out = self.self_attn(q, k, query)[0]
-        query = self.norm_sa(query + self.drop_sa(sa_out))
+        # ── Self-attention ──
+        q_sa = k_sa = tgt + query_pos
+        sa_out = self.self_attn(q_sa, k_sa, tgt)[0]
+        tgt = tgt + self.dropout_sa(sa_out)
+        tgt = self.norm_sa(tgt)
 
-        # Cross-attention to agents
-        q_obj = query + query_pos
-        k_obj = obj_kv + obj_kv_pos
-        ca_obj = self.cross_attn_obj(q_obj, k_obj, obj_kv, key_padding_mask=obj_kv_mask)[0]
-        query = self.norm_obj(query + self.drop_obj(ca_obj))
+        # ── Cross-attention with additive PE ──
+        q_content = self.ca_qcontent_proj(tgt)
+        k_content = self.ca_kcontent_proj(memory)
+        v = self.ca_v_proj(memory)
+        k_pos = self.ca_kpos_proj(pos)
 
-        # Cross-attention to map
-        q_map = query + query_pos
-        k_map = map_kv + map_kv_pos
-        ca_map = self.cross_attn_map(q_map, k_map, map_kv, key_padding_mask=map_kv_mask)[0]
-        query = self.norm_map(query + self.drop_map(ca_map))
+        if query_pos_projected is not None:
+            q = q_content + query_pos_projected
+            k = k_content + k_pos
+        else:
+            q = q_content
+            k = k_content
 
-        # FFN
-        ffn_out = self.ffn(query)
-        query = self.norm_ffn(query + self.drop_ffn(ffn_out))
-        return query
+        query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
+        q = q + query_sine_embed
+        k = k + k_pos
+
+        ca_out = self.cross_attn(
+            query=q,
+            key=k,
+            value=v,
+            key_padding_mask=memory_key_padding_mask,
+        )[0]
+
+        tgt = tgt + self.dropout_ca(ca_out)
+        tgt = self.norm_ca(tgt)
+
+        # ── FFN ──
+        ffn_out = self.linear2(self.dropout1(F.relu(self.linear1(tgt))))
+        tgt = tgt + self.dropout2(ffn_out)
+        tgt = self.norm_ffn(tgt)
+        return tgt
 
 
 # ── Full decoder ──────────────────────────────────────────────────────────────
@@ -115,12 +131,13 @@ _PKL_KEY = {1: "TYPE_VEHICLE", 2: "TYPE_PEDESTRIAN", 3: "TYPE_CYCLIST"}
 
 
 class MTRDecoder(nn.Module):
-    """Intention-query decoder for multi-modal prediction."""
+    """Intention-query decoder for multi-modal prediction (official MTR layout)."""
 
     def __init__(
         self,
         in_channels: int = 256,
         d_model: int = 512,
+        map_d_model: int = 256,
         num_layers: int = 6,
         num_heads: int = 8,
         dropout: float = 0.1,
@@ -132,13 +149,14 @@ class MTRDecoder(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        self.map_d_model = map_d_model
         self.num_layers = num_layers
         self.num_future_frames = num_future_frames
         self.num_motion_modes = num_motion_modes
         self.num_queries = num_intention_queries
         self.nms_dist_thresh = nms_dist_thresh
 
-        # Input projections (encoder d_model → decoder d_model)
+        # Input projections (encoder d_model → decoder d_model / map_d_model)
         self.in_proj_center = nn.Sequential(
             nn.Linear(in_channels, d_model),
             nn.ReLU(),
@@ -150,15 +168,30 @@ class MTRDecoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.in_proj_map = nn.Sequential(
-            nn.Linear(in_channels, d_model),
+            nn.Linear(in_channels, map_d_model),
             nn.ReLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(map_d_model, map_d_model),
         )
 
-        # Decoder layers
-        self.layers = nn.ModuleList(
+        # Separate obj and map decoder layers (matching official)
+        self.obj_decoder_layers = nn.ModuleList(
             [MTRDecoderLayer(d_model, num_heads, d_model * 4, dropout) for _ in range(num_layers)]
         )
+        self.map_decoder_layers = nn.ModuleList(
+            [MTRDecoderLayer(map_d_model, num_heads, map_d_model * 4, dropout) for _ in range(num_layers)]
+        )
+
+        # First-layer query position projections (only used at layer 0)
+        self.obj_ca_qpos_proj = nn.Linear(d_model, d_model)
+        self.map_ca_qpos_proj = nn.Linear(map_d_model, map_d_model)
+
+        # Map query projection MLPs (d_model → map_d_model) when dimensions differ
+        if map_d_model != d_model:
+            self.map_query_content_mlps = nn.ModuleList([nn.Linear(d_model, map_d_model) for _ in range(num_layers)])
+            self.map_query_embed_mlps: nn.Linear | None = nn.Linear(d_model, map_d_model)
+        else:
+            self.map_query_content_mlps = None
+            self.map_query_embed_mlps = None
 
         # Intention query (loaded from k-means cluster centres)
         self.intention_query_mlp = build_mlps(d_model, [d_model, d_model], ret_before_act=True)
@@ -174,8 +207,8 @@ class MTRDecoder(nn.Module):
             d_model * 2, [d_model, d_model, d_model], ret_before_act=True, use_norm=False
         )
 
-        # Feature fusion per decoder layer
-        layer_fuse = build_mlps(d_model * 3, [d_model, d_model], ret_before_act=True)
+        # Feature fusion per decoder layer: center(D) + obj_query(D) + map_query(map_D)
+        layer_fuse = build_mlps(d_model * 2 + map_d_model, [d_model, d_model], ret_before_act=True)
         self.query_feature_fusion = nn.ModuleList([copy.deepcopy(layer_fuse) for _ in range(num_layers)])
 
         # Per-layer prediction heads
@@ -396,6 +429,66 @@ class MTRDecoder(nn.Module):
 
     # ── Forward ───────────────────────────────────────────────────────────
 
+    def _apply_cross_attention(
+        self,
+        kv_feature: Tensor,
+        kv_mask: Tensor,
+        kv_pos: Tensor,
+        query_content: Tensor,
+        query_embed: Tensor,
+        attention_layer: MTRDecoderLayer,
+        dynamic_query_center: Tensor,
+        layer_idx: int,
+        query_content_pre_mlp: nn.Module | None = None,
+        query_embed_pre_mlp: nn.Module | None = None,
+        qpos_proj: nn.Module | None = None,
+    ) -> Tensor:
+        """Apply a single cross-attention step (matching official apply_cross_attention).
+
+        Args:
+            kv_feature: [K, S, D_kv]
+            kv_mask: [K, S]  bool (True = valid)
+            kv_pos: [K, S, 2]
+            query_content: [Q, K, D]
+            query_embed: [Q, K, D]
+            dynamic_query_center: [Q, K, 2]
+            layer_idx: current layer index
+            query_content_pre_mlp: optional projection to map_d_model
+            query_embed_pre_mlp: optional projection to map_d_model
+
+        Returns:
+            query_feature: [Q, K, D_kv]
+        """
+        if query_content_pre_mlp is not None:
+            query_content = query_content_pre_mlp(query_content)
+        if query_embed_pre_mlp is not None:
+            query_embed = query_embed_pre_mlp(query_embed)
+
+        num_q, batch_size, d_model = query_content.shape
+
+        # Sine embedding from dynamic query center
+        searching_query = gen_sineembed_for_position(dynamic_query_center, hidden_dim=d_model)  # [Q, K, D]
+
+        # KV positional encoding
+        kv_pos_2d = kv_pos[..., 0:2]  # [K, S, 2]
+        kv_pos_embed = gen_sineembed_for_position(kv_pos_2d.permute(1, 0, 2), hidden_dim=d_model)  # [S, K, D]
+
+        query_pos_projected = None
+        if layer_idx == 0 and qpos_proj is not None:
+            query_pos_projected = qpos_proj(query_embed)
+
+        query_feature = attention_layer(
+            tgt=query_content,
+            query_pos=query_embed,
+            query_sine_embed=searching_query,
+            memory=kv_feature.permute(1, 0, 2),  # [S, K, D_kv]
+            memory_key_padding_mask=~kv_mask,  # [K, S]
+            pos=kv_pos_embed,
+            query_pos_projected=query_pos_projected,
+        )  # [Q, K, D_kv]
+
+        return query_feature
+
     def forward(self, enc_out: dict[str, Tensor], batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """
         Args:
@@ -428,11 +521,15 @@ class MTRDecoder(nn.Module):
 
         # Input projection
         center_feat = self.in_proj_center(center_feat)  # [K, D]
+
+        # Object projection (only on valid)
         obj_proj = self.in_proj_obj(obj_feat_raw[obj_mask])
         obj_feat = obj_feat_raw.new_zeros(K, obj_feat_raw.shape[1], self.d_model, dtype=obj_proj.dtype)
         obj_feat[obj_mask] = obj_proj
+
+        # Map projection (only on valid) → map_d_model
         map_proj = self.in_proj_map(map_feat_raw[map_mask])
-        map_feat = map_feat_raw.new_zeros(K, map_feat_raw.shape[1], self.d_model, dtype=map_proj.dtype)
+        map_feat = map_feat_raw.new_zeros(K, map_feat_raw.shape[1], self.map_d_model, dtype=map_proj.dtype)
         map_feat[map_mask] = map_proj
 
         # Dense future prediction (auxiliary)
@@ -441,51 +538,59 @@ class MTRDecoder(nn.Module):
         # Intention queries
         intention_pts = self._get_intention_points(center_obj_type)  # [K, Q, 2]
         Q = intention_pts.shape[1]
-        intention_pe = _gen_sineembed_for_position(intention_pts, self.d_model)  # [K, Q, D]
+        intention_pe = gen_sineembed_for_position(intention_pts, self.d_model)  # [K, Q, D]
         intention_embed = self.intention_query_mlp(intention_pe.view(-1, self.d_model)).view(K, Q, self.d_model)
-
-        # Prepare KV positional encodings
-        obj_kv_pos = _gen_sineembed_for_position(obj_pos, self.d_model)  # [K, A, D]
 
         # Transpose to (S, B, D) for nn.MultiheadAttention
         query_content = torch.zeros(Q, K, self.d_model, device=center_feat.device, dtype=center_feat.dtype)
-        query_pos_emb = intention_embed.permute(1, 0, 2)  # [Q, K, D]
+        query_embed = intention_embed.permute(1, 0, 2)  # [Q, K, D]
         center_feat_exp = center_feat[None].expand(Q, -1, -1)  # [Q, K, D]
-        obj_kv_t = obj_feat.permute(1, 0, 2)  # [A, K, D]
-        obj_kv_pos_t = obj_kv_pos.permute(1, 0, 2)  # [A, K, D]
-        obj_pad = ~obj_mask  # [K, A]
 
-        # Initial waypoints for map collection
+        # Initial waypoints for map collection → dynamic_query_center
         pred_waypoints = intention_pts.unsqueeze(2)  # [K, Q, 1, 2]
+        dynamic_query_center = intention_pts.permute(1, 0, 2)  # [Q, K, 2]
 
         pred_list: list[tuple[Tensor, Tensor]] = []
 
         for i in range(self.num_layers):
-            # Collect and gather map KV
+            # ── Object cross-attention ──
+            obj_query_feature = self._apply_cross_attention(
+                kv_feature=obj_feat,
+                kv_mask=obj_mask,
+                kv_pos=obj_pos,
+                query_content=query_content,
+                query_embed=query_embed,
+                attention_layer=self.obj_decoder_layers[i],
+                dynamic_query_center=dynamic_query_center,
+                layer_idx=i,
+                qpos_proj=self.obj_ca_qpos_proj,
+            )  # [Q, K, D]
+
+            # ── Dynamic map collection ──
             coll_idx = self._collect_map_indices(map_pos, map_mask, pred_waypoints)
             map_kv, map_kv_p, map_pad = self._gather_map_kv(map_feat, map_pos, map_mask, coll_idx)
-            map_kv_pos_emb = _gen_sineembed_for_position(map_kv_p, self.d_model)
-            map_kv_t = map_kv.permute(1, 0, 2)  # [M', K, D]
-            map_kv_pos_t = map_kv_pos_emb.permute(1, 0, 2)
+            # map_kv: [K, M', map_D], map_kv_p: [K, M', 2], map_pad: [K, M']
 
-            # Decoder layer
-            query_content = self.layers[i](
-                query=query_content,
-                query_pos=query_pos_emb,
-                obj_kv=obj_kv_t,
-                obj_kv_pos=obj_kv_pos_t,
-                obj_kv_mask=obj_pad,
-                map_kv=map_kv_t,
-                map_kv_pos=map_kv_pos_t,
-                map_kv_mask=map_pad,
-            )
+            # ── Map cross-attention ──
+            map_query_feature = self._apply_cross_attention(
+                kv_feature=map_kv,
+                kv_mask=~map_pad,  # map_pad is True=padding, we need True=valid
+                kv_pos=map_kv_p,
+                query_content=query_content,
+                query_embed=query_embed,
+                attention_layer=self.map_decoder_layers[i],
+                dynamic_query_center=dynamic_query_center,
+                layer_idx=i,
+                query_content_pre_mlp=self.map_query_content_mlps[i]
+                if self.map_query_content_mlps is not None
+                else None,
+                query_embed_pre_mlp=self.map_query_embed_mlps,
+                qpos_proj=self.map_ca_qpos_proj,
+            )  # [Q, K, map_D]
 
-            # Feature fusion: [center, obj_query, map_query] → D
-            # query_content: [Q, K, D]
-            fused = torch.cat([center_feat_exp, query_content, query_content], dim=-1)
-            # ^ Note: MTR concatenates separate obj_query and map_query features.
-            # Our decoder layer already fuses them internally, so we use
-            # [center, query, query] to maintain dimensionality (D*3 → D).
+            # ── Feature fusion: [center, obj_query, map_query] → D ──
+            fused = torch.cat([center_feat_exp, obj_query_feature, map_query_feature], dim=-1)
+            # [Q, K, D + D + map_D]
             query_content = self.query_feature_fusion[i](fused.reshape(Q * K, -1)).view(Q, K, self.d_model)
 
             # Prediction heads
@@ -495,8 +600,9 @@ class MTRDecoder(nn.Module):
 
             pred_list.append((pred_scores, pred_trajs))
 
-            # Update waypoints for next layer
+            # Update waypoints and dynamic query center for next layer
             pred_waypoints = pred_trajs[:, :, :, 0:2].detach()
+            dynamic_query_center = pred_trajs[:, :, 0, 0:2].detach().permute(1, 0, 2)  # [Q, K, 2]
 
         # Final output
         result: dict[str, Tensor] = {

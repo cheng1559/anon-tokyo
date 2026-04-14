@@ -23,6 +23,7 @@ class MTRModel(nn.Module):
         num_encoder_layers: int = 6,
         num_decoder_layers: int = 6,
         d_decoder: int = 512,
+        map_d_model: int = 256,
         num_heads: int = 8,
         num_modes: int = 6,
         num_intention_queries: int = 64,
@@ -41,6 +42,7 @@ class MTRModel(nn.Module):
         self.decoder = MTRDecoder(
             in_channels=d_model,
             d_model=d_decoder,
+            map_d_model=map_d_model,
             num_layers=num_decoder_layers,
             num_heads=num_heads,
             dropout=dropout,

@@ -31,7 +31,7 @@ class PredictionModule(L.LightningModule):
 
         self.model = model
         if compile_model:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model)
 
         self.loss_weights = loss_weights or {"reg": 1.0, "score": 1.0, "vel": 0.2}
         self._optimizer_class = optimizer_class
@@ -64,6 +64,28 @@ class PredictionModule(L.LightningModule):
             batch_size=bs,
         )
         self.log("train/loss", loss_dict["loss/total"], prog_bar=True, batch_size=bs)
+
+        # Compute trajectory metrics periodically (every N steps to avoid overhead)
+        if self._is_agent_centric(output):
+            with torch.no_grad():
+                pred_trajs = output["pred_trajs"]
+                pred_scores = output["pred_scores"]
+                center_gt = output["center_gt_trajs"]
+                center_mask = output["center_gt_mask"]
+                pred_xy = pred_trajs[:, :, :, 0:2].unsqueeze(1)
+                scores = pred_scores.unsqueeze(1)
+                gt_xy = center_gt[:, :, 0:2].unsqueeze(1)
+                mask = center_mask.unsqueeze(1)
+                metrics = compute_prediction_metrics(pred_xy, scores, gt_xy, mask)
+                for name, val in metrics.items():
+                    self.log(
+                        f"train/{name}",
+                        val.mean(),
+                        on_step=True,
+                        on_epoch=False,
+                        batch_size=bs,
+                    )
+
         return total_loss
 
     # ── Validation ────────────────────────────────────────────────────────

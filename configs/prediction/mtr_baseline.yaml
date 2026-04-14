@@ -19,6 +19,10 @@ trainer:
         monitor: val/loss/total
         mode: min
         save_top_k: 3
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        every_n_train_steps: 1000
+        save_top_k: -1
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
 
 model:
@@ -29,6 +33,7 @@ model:
       num_encoder_layers: 6
       num_decoder_layers: 6
       d_decoder: 512
+      map_d_model: 256
       num_heads: 8
       num_modes: 6
       num_intention_queries: 64
@@ -45,10 +50,11 @@ model:
     reg: 1.0
     score: 1.0
     vel: 0.2
+  compile_model: false
 
 data:
   data_root: data/shards
-  batch_size: 16
+  batch_size: 32
   num_workers: 8
   max_agents: 128
-  max_polylines: 4096
+  max_polylines: 768
