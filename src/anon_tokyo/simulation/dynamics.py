@@ -1,0 +1,1 @@
+"""JerkPncModel bicycle dynamics."""

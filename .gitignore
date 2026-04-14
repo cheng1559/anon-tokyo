@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# uv
+.venv*/
+uv.lock
+
+# Data
+data/raw
+data/processed
+data/shards
+
+# Training outputs
+outputs/
+lightning_logs/
+tb_logs/
+checkpoints/
+*.ckpt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reference code
+reference-code
+assets/paper

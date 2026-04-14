@@ -1,0 +1,47 @@
+[project]
+name = "anon-tokyo"
+version = "0.1.0"
+description = "AnonTokyo: Multi-Agent Interaction Modelling with RoPE/DRoPE"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4,<2.6",
+    "lightning>=2.4",
+    "jsonargparse[signatures]>=4.27",
+    "tensorboard>=2.16",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "shapely>=2.0",
+]
+
+[tool.uv]
+# Driver 535 supports CUDA 12.2; use PyTorch cu121 wheels
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu121"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[project.optional-dependencies]
+# NOTE: scripts/ (preprocess_womd.py) requires tensorflow + waymo-open-dataset-tf
+# which pins old numpy/TF versions incompatible with torch. Run in a separate venv:
+#   uv venv .venv-scripts --python 3.10
+#   uv pip install tensorflow==2.12 waymo-open-dataset-tf-2-12-0
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anon_tokyo"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

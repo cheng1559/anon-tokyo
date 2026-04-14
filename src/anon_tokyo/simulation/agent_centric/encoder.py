@@ -1,0 +1,1 @@
+"""Agent-Centric simulation: encoder."""

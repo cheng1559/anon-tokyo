@@ -1,0 +1,1 @@
+"""Binary shard serialization / deserialization."""

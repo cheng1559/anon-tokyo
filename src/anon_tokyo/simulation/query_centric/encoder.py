@@ -1,0 +1,1 @@
+"""Query-Centric simulation: encoder."""
