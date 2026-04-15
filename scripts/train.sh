@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash scripts/train.sh                                  # 训练（自动续训 latest ckpt）
-#   bash scripts/train.sh --name exp01                     # 指定实验名
+#   bash scripts/train.sh --version baseline_v1            # 指定 version 名（续训同一目录）
 #   bash scripts/train.sh --config other.yaml              # 自定义 config
 
 set -euo pipefail
@@ -21,13 +21,13 @@ MASTER_PORT="${MLP_WORKER_0_PORT:-29500}"
 
 # --- Parse named arguments ---
 CONFIG="configs/prediction/mtr_baseline.yaml"
-EXP_NAME=""
+VERSION=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --config)  CONFIG="$2";    shift 2 ;;
-        --name)    EXP_NAME="$2";  shift 2 ;;
-        *)         echo "Unknown arg: $1"; exit 1 ;;
+        --config)   CONFIG="$2";   shift 2 ;;
+        --version)  VERSION="$2";  shift 2 ;;
+        *)          echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
@@ -40,13 +40,13 @@ echo "  node_rank:      ${NODE_RANK}"
 echo "  master_addr:    ${MASTER_ADDR}"
 echo "  master_port:    ${MASTER_PORT}"
 echo "  config:         ${CONFIG}"
-echo "  exp_name:       ${EXP_NAME:-<default>}"
+echo "  version:        ${VERSION:-<auto>}"
 echo "======================="
 
 # Build extra CLI args
 # ckpt_path=last: auto-resume from latest checkpoint if exists, otherwise train from scratch
 EXTRA_ARGS=(--ckpt_path last)
-[[ -n "${EXP_NAME}" ]] && EXTRA_ARGS+=(--trainer.logger.init_args.name "${EXP_NAME}")
+[[ -n "${VERSION}" ]] && EXTRA_ARGS+=(--trainer.logger.init_args.version "${VERSION}")
 
 exec uv run torchrun \
     --nproc_per_node="${NPROC_PER_NODE}" \
