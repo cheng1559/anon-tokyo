@@ -46,17 +46,18 @@ model:
     lr: 1.0e-4
     weight_decay: 0.01
   scheduler_kwargs:
-    warmup_ratio: 0.2
-    eta_min: 1.0e-6
+    decay_step_list: [22, 24, 26, 28]
+    lr_decay: 0.5
+    lr_clip: 1.0e-6
   loss_weights:
     reg: 1.0
     score: 1.0
-    vel: 0.2
+    vel: 0.5
   compile_model: false
 
 data:
   data_root: data/shards
-  batch_size: 30
+  batch_size: 10
   num_workers: 8
   max_agents: 128
   max_polylines: 768
