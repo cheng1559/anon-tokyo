@@ -52,3 +52,5 @@ data:
     num_workers: 8
     max_agents: 128
     max_polylines: 4096
+    use_npz: true
+    npz_root: data/processed

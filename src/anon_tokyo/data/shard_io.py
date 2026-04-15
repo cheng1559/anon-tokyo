@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,16 +92,34 @@ def write_shard(
 # Reading
 # ---------------------------------------------------------------------------
 
-def read_item(shard_path: Path, offset: int, size: int) -> dict[str, np.ndarray]:
-    """Read a single scenario from a shard file by byte offset and size."""
-    with open(shard_path, "rb") as fp:
-        fp.seek(offset)
-        blob = fp.read(size)
+def read_item(shard_path: Path | str, offset: int, size: int, *, fd: int | None = None) -> dict[str, np.ndarray]:
+    """Read a single scenario from a shard file by byte offset and size.
+
+    When *fd* is provided the caller-managed file descriptor is used with
+    ``os.pread`` (single syscall, no seek, safe under concurrent access).
+    """
+    blob = _pread_blob(shard_path, offset, size, fd=fd)
     return dict(np.load(io.BytesIO(blob), allow_pickle=False))
 
 
-def read_item_raw(shard_path: Path, offset: int, size: int) -> bytes:
+def read_item_raw(shard_path: Path | str, offset: int, size: int, *, fd: int | None = None) -> bytes:
     """Read raw npz bytes from a shard file (for testing / re-packing)."""
-    with open(shard_path, "rb") as fp:
-        fp.seek(offset)
-        return fp.read(size)
+    return _pread_blob(shard_path, offset, size, fd=fd)
+
+
+def _pread_blob(shard_path: Path | str, offset: int, size: int, *, fd: int | None = None) -> bytes:
+    """Read *size* bytes at *offset* using a single ``os.pread`` call."""
+    own_fd = fd is None
+    if own_fd:
+        fd = os.open(str(shard_path), os.O_RDONLY)
+    try:
+        blob = os.pread(fd, size, offset)
+    finally:
+        if own_fd:
+            os.close(fd)
+    if len(blob) != size:
+        raise ValueError(
+            f"Short read from {shard_path}: expected {size} bytes at "
+            f"offset {offset}, got {len(blob)}"
+        )
+    return blob

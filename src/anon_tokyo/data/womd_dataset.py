@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -38,10 +39,26 @@ class WOMDDataset(Dataset):
         self.index = ShardIndex.load(self.split_dir / "index.json")
 
         if use_npz:
-            root = Path(npz_root) if npz_root else self.split_dir
+            root = Path(npz_root) / split if npz_root else self.split_dir
             self._npz_paths = [root / f"{sid}.npz" for sid in self.index.scenario_ids]
         else:
-            self._shard_paths = [self.split_dir / s for s in self.index.shards]
+            self._shard_paths = [str(self.split_dir / s) for s in self.index.shards]
+
+        # Lazily opened per-worker file descriptors (populated on first read)
+        self._shard_fds: dict[int, int] | None = None
+
+    def _get_fd(self, shard_idx: int) -> int:
+        if self._shard_fds is None:
+            self._shard_fds = {}
+        if shard_idx not in self._shard_fds:
+            self._shard_fds[shard_idx] = os.open(self._shard_paths[shard_idx], os.O_RDONLY)
+        return self._shard_fds[shard_idx]
+
+    def __del__(self) -> None:
+        if self._shard_fds:
+            for fd in self._shard_fds.values():
+                os.close(fd)
+            self._shard_fds.clear()
 
     def __len__(self) -> int:
         return len(self.index)
@@ -50,7 +67,8 @@ class WOMDDataset(Dataset):
         if self.use_npz:
             return dict(np.load(self._npz_paths[idx], allow_pickle=False))
         shard_idx, offset, size = self.index.items[idx]
-        return read_item(self._shard_paths[shard_idx], offset, size)
+        fd = self._get_fd(shard_idx)
+        return read_item(self._shard_paths[shard_idx], offset, size, fd=fd)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         data = self._load_raw(idx)
