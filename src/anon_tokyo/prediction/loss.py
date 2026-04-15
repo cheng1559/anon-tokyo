@@ -236,8 +236,7 @@ def _nll_loss_gmm_flat(
     z = dx * dx / (std1 * std1) + dy * dy / (std2 * std2) - 2 * rho * dx * dy / (std1 * std2)
     nll = log_coeff + 0.5 * z / one_minus_rho2
 
-    valid_count = gt_mask.sum(dim=-1).clamp(min=1)
-    reg_loss = (nll * gt_mask).sum(dim=-1) / valid_count
+    reg_loss = (nll * gt_mask).sum(dim=-1)
 
     return reg_loss, winner_idx
 
@@ -298,8 +297,7 @@ def mtr_prediction_loss(
         winner_vel = pred_vel[n_idx, positive_idx]  # [K, T, 2]
         gt_vel = center_gt[:, :, 2:4]
         vel_l1 = (winner_vel - gt_vel).abs().sum(dim=-1)
-        valid_count = center_mask.sum(dim=-1).clamp(min=1)
-        loss_vel = (vel_l1 * center_mask).sum(dim=-1) / valid_count
+        loss_vel = (vel_l1 * center_mask).sum(dim=-1)
 
         # Classification loss
         loss_cls = F.cross_entropy(scores, positive_idx, reduction="none")

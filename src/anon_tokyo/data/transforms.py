@@ -117,15 +117,21 @@ def scene_centric_transform(
     fut_mask = valid[:, history_len:].astype(np.float32)
     fut_feat[fut_mask == 0] = 0
 
-    # Position at current_t (for RoPE)
-    positions = t[:, current_t, 0:2].astype(np.float32)
-
-    # Heading at current_t (for DRoPE)
-    headings = t[:, current_t, 6].astype(np.float32)
+    # Last valid observed position / heading per agent (vectorised).
+    # Agents unobserved at current_t have raw coords [0,0] which become
+    # -center_xy after SDC centering (thousands of metres off), so we must
+    # use the latest actually-observed timestep instead.
+    hist_valid = valid[:, :history_len] > 0  # (A, T_hist)
+    last_t = np.where(hist_valid, np.arange(history_len), -1).max(1)  # (A,)
+    has_any = last_t >= 0
+    last_t = last_t.clip(min=0)
+    ai = np.arange(num_agents)
+    positions = (t[ai, last_t, 0:2] * has_any[:, None]).astype(np.float32)
+    headings = (t[ai, last_t, 6] * has_any).astype(np.float32)
 
     # Agent-local future offset (regression target)
     # Δp_local = R(-ψ'_i)^T (p'_future - p'_last_obs)  — paper Eq. gt_offset
-    agent_pos_ct = t[:, current_t, 0:2]  # (A, 2)
+    agent_pos_ct = positions.copy()  # last valid observed position (A, 2)
     fut_xy = fut[:, :, 0:2] - agent_pos_ct[:, None, :]  # offset from current_t pos
     fut_vxy = fut[:, :, 7:9].copy()
     fut_local = np.zeros((num_agents, future_len, 4), dtype=np.float32)

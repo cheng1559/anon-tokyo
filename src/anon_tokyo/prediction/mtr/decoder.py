@@ -602,7 +602,7 @@ class MTRDecoder(nn.Module):
 
             # Update waypoints and dynamic query center for next layer
             pred_waypoints = pred_trajs[:, :, :, 0:2].detach()
-            dynamic_query_center = pred_trajs[:, :, 0, 0:2].detach().permute(1, 0, 2)  # [Q, K, 2]
+            dynamic_query_center = pred_trajs[:, :, -1, 0:2].detach().permute(1, 0, 2)  # [Q, K, 2]
 
         # Final output
         result: dict[str, Tensor] = {
