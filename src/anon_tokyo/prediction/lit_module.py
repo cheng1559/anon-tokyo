@@ -8,7 +8,7 @@ import lightning as L
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 
 from anon_tokyo.prediction.loss import mtr_prediction_loss, prediction_loss
 from anon_tokyo.prediction.metrics import compute_prediction_metrics
@@ -44,7 +44,7 @@ class PredictionModule(L.LightningModule):
     # ── Training ──────────────────────────────────────────────────────────
 
     def _is_agent_centric(self, output: dict[str, Tensor]) -> bool:
-        return "pred_list" in output
+        return "batch_idx" in output
 
     def training_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
         output = self.model(batch)
@@ -81,6 +81,32 @@ class PredictionModule(L.LightningModule):
                     self.log(
                         f"train/{name}",
                         val.mean(),
+                        on_step=True,
+                        on_epoch=False,
+                        batch_size=bs,
+                    )
+        else:
+            with torch.no_grad():
+                B = output["pred_trajs"].shape[0]
+                K = output["pred_trajs"].shape[1]
+                ttp = batch["tracks_to_predict"]
+                ttp_clamped = ttp.clamp(min=0)
+                b_idx = torch.arange(B, device=ttp.device)[:, None].expand(B, K)
+                gt_local = batch["obj_trajs_future_local"][b_idx, ttp_clamped[:, :K]]
+                gt_mask = batch["obj_trajs_future_mask"][b_idx, ttp_clamped[:, :K]]
+                pred_xy = output["pred_trajs"][:, :, :, :, 0:2]
+                metrics = compute_prediction_metrics(
+                    pred_xy,
+                    output["pred_scores"],
+                    gt_local[:, :, :, 0:2],
+                    gt_mask,
+                )
+                ttp_valid = (ttp[:, :K] >= 0).float()
+                valid_count = ttp_valid.sum().clamp(min=1)
+                for name, val in metrics.items():
+                    self.log(
+                        f"train/{name}",
+                        (val * ttp_valid).sum() / valid_count,
                         on_step=True,
                         on_epoch=False,
                         batch_size=bs,
@@ -172,24 +198,25 @@ class PredictionModule(L.LightningModule):
 
         sk = self._scheduler_kwargs
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = int(total_steps * sk.get("warmup_ratio", 0.1))
-        warmup_steps = max(warmup_steps, 1)
+        max_epochs = self.trainer.max_epochs or 30
+        steps_per_epoch = max(total_steps // max_epochs, 1)
+        lr_base = self._optimizer_kwargs.get("lr", 1e-4)
+        lr_clip = sk.get("lr_clip", 1e-6)
 
-        warmup = LinearLR(
-            optimizer,
-            start_factor=sk.get("start_factor", 0.1),
-            total_iters=warmup_steps,
-        )
-        cosine = CosineAnnealingLR(
-            optimizer,
-            T_max=max(total_steps - warmup_steps, 1),
-            eta_min=sk.get("eta_min", 1e-6),
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[warmup_steps],
-        )
+        # Step-decay schedule matching official MTR:
+        # constant LR until decay epochs, then multiply by lr_decay at each.
+        decay_epochs = sk.get("decay_step_list", [22, 24, 26, 28])
+        lr_decay = sk.get("lr_decay", 0.5)
+        decay_steps = [e * steps_per_epoch for e in decay_epochs]
+
+        def lr_lambda(cur_step: int) -> float:
+            factor = 1.0
+            for ds in decay_steps:
+                if cur_step >= ds:
+                    factor *= lr_decay
+            return max(factor, lr_clip / lr_base)
+
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
         return {
             "optimizer": optimizer,

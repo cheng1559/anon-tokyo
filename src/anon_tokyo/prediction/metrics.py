@@ -1,14 +1,17 @@
-"""WOMD evaluation metrics: minADE, minFDE, MissRate."""
+"""WOMD evaluation metrics: minADE, minFDE, MissRate.
+
+Aligned with MTR official ``get_ade_of_waymo``:
+  - 80-frame predictions are downsampled to 2 Hz (every 5th frame starting at 4).
+  - ADE is computed at three horizons (step 5 / 9 / 15) then averaged.
+"""
 
 from __future__ import annotations
 
 import torch
 from torch import Tensor
 
-# WOMD miss-rate thresholds by trajectory shape class (metres).
-# Simplified: use lateral/longitudinal thresholds from WOMD.
-# Full mAP requires 8-class motion classification — deferred.
 _DEFAULT_MISS_THRESHOLD = 2.0  # metres (endpoint L2)
+_CALCULATE_STEPS = (5, 9, 15)  # WOMD evaluation horizons (2 Hz indices)
 
 
 def compute_prediction_metrics(
@@ -19,7 +22,7 @@ def compute_prediction_metrics(
     *,
     miss_threshold: float = _DEFAULT_MISS_THRESHOLD,
 ) -> dict[str, Tensor]:
-    """Compute open-loop prediction metrics.
+    """Compute open-loop prediction metrics (aligned with MTR official).
 
     All inputs are in the same coordinate frame (agent-local recommended).
 
@@ -32,18 +35,33 @@ def compute_prediction_metrics(
     Returns:
         dict with keys ``minADE``, ``minFDE``, ``MissRate`` — each ``[B, K]``.
     """
-    # Per-mode displacement errors
-    err = (pred_trajs - gt_trajs[:, :, None, :, :]).norm(dim=-1)  # [B, K, M, T]
-    err = err * gt_mask[:, :, None, :]  # zero out invalid
+    T = pred_trajs.shape[3]
 
-    valid_count = gt_mask.sum(dim=-1).clamp(min=1)  # [B, K]
+    # Downsample 10 Hz → 2 Hz if 80 frames (matching MTR official)
+    if T == 80:
+        pred_trajs = pred_trajs[:, :, :, 4::5]  # [B, K, M, 16, 2]
+        gt_trajs = gt_trajs[:, :, 4::5]  # [B, K, 16, 2]
+        gt_mask = gt_mask[:, :, 4::5]  # [B, K, 16]
 
-    # ADE per mode: mean over valid frames
-    ade = err.sum(dim=-1) / valid_count[:, :, None]  # [B, K, M]
-    min_ade = ade.min(dim=-1).values  # [B, K]
+    # Per-mode displacement errors on downsampled frames
+    err = (pred_trajs - gt_trajs[:, :, None, :, :]).norm(dim=-1)  # [B, K, M, T']
+    err = err * gt_mask[:, :, None, :]
 
-    # FDE per mode: error at last valid frame
-    # Find last valid index per agent
+    # minADE: average of truncated ADE at steps 5, 9, 15 (MTR official)
+    ade_sum = torch.zeros(err.shape[0], err.shape[1], device=err.device)
+    n_steps = 0
+    for step in _CALCULATE_STEPS:
+        if step >= err.shape[3]:
+            continue
+        n_steps += 1
+        trunc_err = err[:, :, :, : step + 1]
+        trunc_mask = gt_mask[:, :, : step + 1]
+        valid_count = trunc_mask.sum(dim=-1).clamp(min=1)  # [B, K]
+        trunc_ade = trunc_err.sum(dim=-1) / valid_count[:, :, None]  # [B, K, M]
+        ade_sum += trunc_ade.min(dim=-1).values
+    min_ade = ade_sum / max(n_steps, 1)  # [B, K]
+
+    # minFDE: error at last valid downsampled frame
     last_valid = _last_valid_index(gt_mask)  # [B, K]
     b_idx = torch.arange(err.shape[0], device=err.device)[:, None].expand_as(last_valid)
     k_idx = torch.arange(err.shape[1], device=err.device)[None, :].expand_as(last_valid)
@@ -64,5 +82,5 @@ def _last_valid_index(mask: Tensor) -> Tensor:
     """Return index of last valid (>0) frame per agent. ``mask``: ``[B, K, T]``."""
     T = mask.shape[-1]
     idx = torch.arange(T, device=mask.device).expand_as(mask)
-    idx = idx * mask  # zero out invalid
+    idx = idx * mask
     return idx.max(dim=-1).values.long().clamp(min=0)

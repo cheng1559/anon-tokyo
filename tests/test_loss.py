@@ -148,13 +148,43 @@ class TestPredictionLoss:
             "obj_trajs_future_local": torch.randn(B, A, T, 4),
             "obj_trajs_future_mask": torch.ones(B, A, T),
             "tracks_to_predict": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]] * B),
-            "obj_trajs": torch.randn(B, A, 11, 10),  # needed for batch_size in log
+            "obj_trajs": torch.randn(B, A, 11, 10),
+            "obj_types": torch.randint(1, 4, (B, A)),
         }
         weights = {"reg": 1.0, "score": 1.0, "vel": 0.2}
         total, loss_dict = prediction_loss(output, batch, weights)
         assert total.shape == ()
         assert total.requires_grad
-        assert set(loss_dict.keys()) == {"loss/reg", "loss/score", "loss/vel", "loss/total"}
+        base_keys = {k for k in loss_dict if not k.startswith("ade/")}
+        assert base_keys == {
+            "loss/layer0",
+            "loss/layer0_reg_gmm",
+            "loss/layer0_reg_vel",
+            "loss/layer0_cls",
+            "loss/decoder",
+            "loss/total",
+        }
+        assert any(k.startswith("ade/") for k in loss_dict)
+
+    def test_combined_with_dense(self) -> None:
+        """Loss includes dense when pred_dense_trajs is present."""
+        B, K, M, T, A = 2, 2, 6, 80, 32
+        output = {
+            "pred_trajs": torch.randn(B, K, M, T, 7, requires_grad=True),
+            "pred_scores": torch.randn(B, K, M, requires_grad=True),
+            "pred_dense_trajs": torch.randn(B, K, A, T, 7, requires_grad=True),
+        }
+        batch = {
+            "obj_trajs_future_local": torch.randn(B, A, T, 4),
+            "obj_trajs_future_mask": torch.ones(B, A, T),
+            "obj_trajs_future": torch.randn(B, A, T, 4),
+            "tracks_to_predict": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]] * B),
+            "obj_trajs": torch.randn(B, A, 11, 10),
+            "obj_types": torch.randint(1, 4, (B, A)),
+        }
+        total, loss_dict = prediction_loss(output, batch, {"reg": 1.0, "score": 1.0, "vel": 0.2})
+        assert "loss/dense" in loss_dict
+        assert total.requires_grad
 
     def test_gradients_flow(self) -> None:
         """Ensure gradients flow through all loss components."""
@@ -167,6 +197,7 @@ class TestPredictionLoss:
             "obj_trajs_future_mask": torch.ones(B, A, T),
             "tracks_to_predict": torch.tensor([[0, -1, -1, -1, -1, -1, -1, -1]]),
             "obj_trajs": torch.randn(B, A, 11, 10),
+            "obj_types": torch.randint(1, 4, (B, A)),
         }
         total, _ = prediction_loss(output, batch, {"reg": 1.0, "score": 1.0, "vel": 0.2})
         total.backward()

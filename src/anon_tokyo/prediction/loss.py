@@ -57,9 +57,8 @@ def nll_loss_gmm(
     z = dx * dx / (std1 * std1) + dy * dy / (std2 * std2) - 2 * rho * dx * dy / (std1 * std2)
     nll = log_coeff + 0.5 * z / one_minus_rho2  # [B, K, T]
 
-    # Average over valid time steps
-    valid_count = gt_mask.sum(dim=-1).clamp(min=1)  # [B, K]
-    reg_loss = (nll * gt_mask).sum(dim=-1) / valid_count  # [B, K]
+    # Sum over valid time steps (matches MTR _nll_loss_gmm_flat)
+    reg_loss = (nll * gt_mask).sum(dim=-1)  # [B, K]
 
     return reg_loss, winner_idx
 
@@ -105,8 +104,39 @@ def velocity_loss(
     winner_vel = pred_vel[b_idx, k_idx, winner_idx]  # [B, K, T, 2]
 
     l1 = (winner_vel - gt_vel).abs().sum(dim=-1)  # [B, K, T]
-    valid_count = gt_mask.sum(dim=-1).clamp(min=1)
-    return (l1 * gt_mask).sum(dim=-1) / valid_count  # [B, K]
+    return (l1 * gt_mask).sum(dim=-1)  # [B, K]  (sum over T, matches MTR)
+
+
+def _dense_future_loss_scene(
+    pred_dense: Tensor,
+    gt_future: Tensor,
+    gt_mask: Tensor,
+) -> Tensor:
+    """Dense future prediction loss for scene-centric models.
+
+    Same computation as ``_dense_future_loss`` but with ``[B, A, T, ...]``
+    layout instead of ``[K, A, T, ...]``.
+    """
+    B, A, T, _ = pred_dense.shape
+    pred_gmm = pred_dense[:, :, :, 0:5]
+    pred_vel = pred_dense[:, :, :, 5:7]
+    gt_xy = gt_future[:, :, :, 0:2]
+    gt_vel = gt_future[:, :, :, 2:4]
+
+    vel_l1 = (pred_vel - gt_vel).abs().sum(dim=-1) * gt_mask  # [B, A, T]
+    vel_l1 = vel_l1.sum(dim=-1)  # [B, A]
+
+    flat_pred = pred_gmm.reshape(B * A, 1, T, 5)
+    flat_gt = gt_xy.reshape(B * A, T, 2)
+    flat_mask = gt_mask.reshape(B * A, T)
+    fake_idx = torch.zeros(B * A, device=pred_dense.device, dtype=torch.long)
+    reg_loss, _ = _nll_loss_gmm_flat(flat_pred, flat_gt, flat_mask, pre_winner_idx=fake_idx)
+    reg_loss = reg_loss.reshape(B, A)
+
+    loss_per_agent = vel_l1 + reg_loss
+    agent_valid = gt_mask.sum(dim=-1) > 0
+    loss_per_sample = (loss_per_agent * agent_valid.float()).sum(dim=-1) / agent_valid.sum(dim=-1).clamp(min=1)
+    return loss_per_sample.mean()
 
 
 def prediction_loss(
@@ -149,39 +179,80 @@ def prediction_loss(
     gt_trajs = gt_future_local[b_idx, ttp_clamped[:, :K]]  # [B, K, T, 4]
     gt_mask = gt_future_mask[b_idx, ttp_clamped[:, :K]]  # [B, K, T]
 
-    # GMM regression loss
-    pred_gmm = pred_trajs[:, :, :, :, 0:5]
     gt_xy = gt_trajs[:, :, :, 0:2]
-    loss_reg, winner_idx = nll_loss_gmm(pred_gmm, gt_xy, gt_mask)
-
-    # Score classification loss
-    loss_cls = score_loss(pred_scores, winner_idx)
-
-    # Velocity loss
-    pred_vel = pred_trajs[:, :, :, :, 5:7]
     gt_vel = gt_trajs[:, :, :, 2:4]
-    loss_vel = velocity_loss(pred_vel, gt_vel, gt_mask, winner_idx)
 
     # Mask out invalid tracks_to_predict padding
     agent_valid = ttp_mask[:, :K].float()
     valid_count = agent_valid.sum().clamp(min=1)
 
-    loss_reg_mean = (loss_reg * agent_valid).sum() / valid_count
-    loss_cls_mean = (loss_cls * agent_valid).sum() / valid_count
-    loss_vel_mean = (loss_vel * agent_valid).sum() / valid_count
+    w_reg = loss_weights.get("reg", 1.0)
+    w_cls = loss_weights.get("score", 1.0)
+    w_vel = loss_weights.get("vel", 0.2)
 
-    total = (
-        loss_weights.get("reg", 1.0) * loss_reg_mean
-        + loss_weights.get("score", 1.0) * loss_cls_mean
-        + loss_weights.get("vel", 0.2) * loss_vel_mean
-    )
+    # Build layer list: pred_list contains ALL layers (including final);
+    # fall back to single layer from pred_trajs/pred_scores when absent.
+    if "pred_list" in output:
+        layers = output["pred_list"]
+    else:
+        layers = [(pred_scores, pred_trajs)]
 
-    return total, {
-        "loss/reg": loss_reg_mean.detach(),
-        "loss/score": loss_cls_mean.detach(),
-        "loss/vel": loss_vel_mean.detach(),
-        "loss/total": total.detach(),
-    }
+    loss_dict: dict[str, Tensor] = {}
+    num_layers = len(layers)
+    total_decoder_loss = gt_xy.new_tensor(0.0)
+
+    for i, (sc_i, tr_i) in enumerate(layers):
+        gmm_i = tr_i[:, :, :, :, 0:5]
+        reg_i, win_i = nll_loss_gmm(gmm_i, gt_xy, gt_mask)
+        cls_i = score_loss(sc_i, win_i)
+        vel_i = velocity_loss(tr_i[:, :, :, :, 5:7], gt_vel, gt_mask, win_i)
+
+        # reg_i, vel_i: [B, K] summed over T;  cls_i: [B, K]
+        # Mask invalid agents, then reduce exactly like MTR:
+        #   (w_reg * reg + w_vel * vel).mean() + w_cls * cls.sum()
+        masked_reg = (reg_i * agent_valid).reshape(-1)
+        masked_vel = (vel_i * agent_valid).reshape(-1)
+        masked_cls = (cls_i * agent_valid).reshape(-1)
+
+        layer_loss = (w_reg * masked_reg + w_vel * masked_vel).mean() + w_cls * masked_cls.sum()
+        total_decoder_loss = total_decoder_loss + layer_loss
+
+        loss_dict[f"loss/layer{i}"] = layer_loss.detach()
+        loss_dict[f"loss/layer{i}_reg_gmm"] = (masked_reg.sum() / valid_count * w_reg).detach()
+        loss_dict[f"loss/layer{i}_reg_vel"] = (masked_vel.sum() / valid_count * w_vel).detach()
+        loss_dict[f"loss/layer{i}_cls"] = (masked_cls.sum() / valid_count * w_cls).detach()
+
+        # Per-type ADE on last decoder layer
+        if i + 1 == num_layers:
+            BK = B * K
+            flat_valid = agent_valid.reshape(BK).bool()
+            if flat_valid.any():
+                center_types = batch["obj_types"][b_idx, ttp_clamped[:, :K]].reshape(BK)
+                _log_ade_per_type(
+                    loss_dict,
+                    pred_xy=gmm_i[:, :, :, :, 0:2].reshape(BK, -1, gmm_i.shape[3], 2)[flat_valid],
+                    gt_xy=gt_xy.reshape(BK, -1, 2)[flat_valid],
+                    gt_mask=gt_mask.reshape(BK, -1)[flat_valid],
+                    obj_types=center_types[flat_valid],
+                    post_tag=f"_layer{i}",
+                )
+
+    total_decoder_loss = total_decoder_loss / num_layers
+    total_loss = total_decoder_loss
+
+    # Dense future prediction auxiliary loss
+    if "pred_dense_trajs" in output and "obj_trajs_future" in batch:
+        dense_loss = _dense_future_loss_scene(
+            output["pred_dense_trajs"][:, 0],
+            batch["obj_trajs_future"],
+            batch["obj_trajs_future_mask"],
+        )
+        total_loss = total_loss + dense_loss
+        loss_dict["loss/dense"] = dense_loss.detach()
+
+    loss_dict["loss/decoder"] = total_decoder_loss.detach()
+    loss_dict["loss/total"] = total_loss.detach()
+    return total_loss, loss_dict
 
 
 # ── MTR agent-centric loss ───────────────────────────────────────────────────
@@ -241,6 +312,56 @@ def _nll_loss_gmm_flat(
     return reg_loss, winner_idx
 
 
+_TYPE_NAMES = {1: "TYPE_VEHICLE", 2: "TYPE_PEDESTRIAN", 3: "TYPE_CYCLIST"}
+_ADE_CALC_STEPS = (5, 9, 15)
+
+
+def _log_ade_per_type(
+    loss_dict: dict[str, Tensor],
+    pred_xy: Tensor,
+    gt_xy: Tensor,
+    gt_mask: Tensor,
+    obj_types: Tensor,
+    post_tag: str = "",
+) -> None:
+    """Add per-type minADE to *loss_dict* (matching official ``get_ade_of_each_category``).
+
+    Args:
+        pred_xy:   ``[K, M, T, 2]`` — predicted positions.
+        gt_xy:     ``[K, T, 2]``    — ground-truth positions.
+        gt_mask:   ``[K, T]``       — valid mask.
+        obj_types: ``[K]``          — integer type (1=Vehicle, 2=Ped, 3=Cyclist).
+    """
+    T = pred_xy.shape[2]
+    p, g, m = pred_xy, gt_xy, gt_mask
+    if T == 80:
+        p = p[:, :, 4::5]
+        g = g[:, 4::5]
+        m = m[:, 4::5]
+
+    err = (p - g[:, None]).norm(dim=-1)  # [K, M, T']
+    err = err * m[:, None]
+
+    # minADE averaged over 3 horizons (official pattern)
+    ade_sum = torch.zeros(err.shape[0], device=err.device)
+    n_steps = 0
+    for step in _ADE_CALC_STEPS:
+        if step >= err.shape[2]:
+            continue
+        n_steps += 1
+        trunc_err = err[:, :, : step + 1]
+        trunc_mask = m[:, : step + 1]
+        valid_cnt = trunc_mask.sum(dim=-1).clamp(min=1)  # [K]
+        trunc_ade = trunc_err.sum(dim=-1) / valid_cnt[:, None]  # [K, M]
+        ade_sum += trunc_ade.min(dim=-1).values  # winner mode
+    min_ade = ade_sum / max(n_steps, 1)  # [K]
+
+    for type_id, type_name in _TYPE_NAMES.items():
+        type_mask = obj_types == type_id
+        if type_mask.any():
+            loss_dict[f"ade/{type_name}{post_tag}"] = min_ade[type_mask].mean()
+
+
 def mtr_prediction_loss(
     output: dict[str, Tensor],
     loss_weights: dict[str, float],
@@ -253,6 +374,7 @@ def mtr_prediction_loss(
         ``intention_points``: ``[K, Q, 2]``
         ``center_gt_trajs``: ``[K, T, 4]`` (x, y, vx, vy)
         ``center_gt_mask``: ``[K, T]``
+        ``center_obj_type``: ``[K]`` (int: 1=Vehicle, 2=Ped, 3=Cyclist)
         ``obj_trajs_future``: ``[K, A, T, 4]``
         ``obj_trajs_future_mask``: ``[K, A, T]``
     """
@@ -274,7 +396,7 @@ def mtr_prediction_loss(
 
     w_reg = loss_weights.get("reg", 1.0)
     w_cls = loss_weights.get("score", 1.0)
-    w_vel = loss_weights.get("vel", 0.2)
+    w_vel = loss_weights.get("vel", 0.5)
 
     loss_dict: dict[str, Tensor] = {}
     total_decoder_loss = gt_xy.new_tensor(0.0)
@@ -302,9 +424,27 @@ def mtr_prediction_loss(
         # Classification loss
         loss_cls = F.cross_entropy(scores, positive_idx, reduction="none")
 
-        layer_loss = (w_reg * loss_reg + w_vel * loss_vel + w_cls * loss_cls).mean()
+        # Official MTR: loss_cls.sum(dim=-1) on [K] gives scalar, broadcast
+        # into per-sample reg+vel before .mean() → cls effective weight ×K.
+        layer_loss = (w_reg * loss_reg + w_vel * loss_vel).mean() + w_cls * loss_cls.sum()
         total_decoder_loss = total_decoder_loss + layer_loss
+
+        # Per-layer detailed logging (matches official tb_dict keys)
         loss_dict[f"loss/layer{i}"] = layer_loss.detach()
+        loss_dict[f"loss/layer{i}_reg_gmm"] = loss_reg.mean().detach() * w_reg
+        loss_dict[f"loss/layer{i}_reg_vel"] = loss_vel.mean().detach() * w_vel
+        loss_dict[f"loss/layer{i}_cls"] = loss_cls.mean().detach() * w_cls
+
+        # Per-type ADE on last decoder layer
+        if i + 1 == num_layers:
+            _log_ade_per_type(
+                loss_dict,
+                pred_xy=pred_gmm[:, :, :, 0:2].detach(),
+                gt_xy=gt_xy,
+                gt_mask=center_mask,
+                obj_types=output["center_obj_type"],
+                post_tag=f"_layer{i}",
+            )
 
     total_decoder_loss = total_decoder_loss / num_layers
 
