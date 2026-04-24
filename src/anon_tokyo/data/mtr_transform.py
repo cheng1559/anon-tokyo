@@ -9,6 +9,9 @@ from anon_tokyo.data.transforms import break_polylines
 
 
 def _rotate_np(xy: np.ndarray, angle: np.ndarray | float) -> np.ndarray:
+    angle = np.asarray(angle)
+    while angle.ndim < xy.ndim - 1:
+        angle = angle[..., None]
     x, y = xy[..., 0], xy[..., 1]
     c, s = np.cos(angle), np.sin(angle)
     return np.stack((x * c - y * s, x * s + y * c), axis=-1).astype(np.float32)

@@ -171,23 +171,29 @@ class MultiheadAttention(nn.Module):
         src_len = key.shape[0]
         q, k, v = self._project(query, key, value)
 
-        q = q.reshape(tgt_len, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-        k = k.reshape(src_len, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-        v = v.reshape(src_len, batch_size, self.num_heads, self.v_head_dim).permute(1, 2, 0, 3)
+        q = q.contiguous().view(tgt_len, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.contiguous().view(src_len, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+        v = v.contiguous().view(src_len, batch_size * self.num_heads, self.v_head_dim).transpose(0, 1)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        q = q / math.sqrt(self.head_dim)
+        scores = torch.bmm(q, k.transpose(-2, -1))
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask[None, None], float("-inf"))
+                scores = scores.masked_fill(attn_mask[None], float("-inf"))
             else:
-                scores = scores + attn_mask[None, None]
+                scores = scores + attn_mask[None]
         if key_padding_mask is not None:
-            scores = scores.masked_fill(key_padding_mask[:, None, None, :].bool(), float("-inf"))
+            padding_mask = key_padding_mask.bool().view(batch_size, 1, 1, src_len)
+            padding_mask = padding_mask.expand(-1, self.num_heads, -1, -1).reshape(
+                batch_size * self.num_heads, 1, src_len
+            )
+            scores = scores.masked_fill(padding_mask, float("-inf"))
         weights = F.softmax(scores, dim=-1)
         weights = F.dropout(weights, p=self.dropout, training=self.training)
-        out = torch.matmul(weights, v)
-        out = out.permute(2, 0, 1, 3).reshape(tgt_len, batch_size, self.vdim)
-        return self.out_proj(out), weights.mean(dim=1)
+        out = torch.bmm(weights, v)
+        out = out.transpose(0, 1).contiguous().view(tgt_len, batch_size, self.vdim)
+        weights = weights.view(batch_size, self.num_heads, tgt_len, src_len)
+        return self.out_proj(out), weights.sum(dim=1) / self.num_heads
 
 
 class MultiheadAttentionLocal(nn.Module):

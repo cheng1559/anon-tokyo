@@ -557,10 +557,13 @@ class MTRDecoder(nn.Module):
         num_polylines = map_feature.shape[1]
 
         center_objects_feature = self.in_proj_center_obj(center_objects_feature)
-        obj_proj = self.in_proj_obj(obj_feature.flatten(0, 1)).view(num_center_objects, num_objects, -1)
-        obj_proj = obj_proj * obj_mask.unsqueeze(-1).type_as(obj_proj)
-        map_proj = self.in_proj_map(map_feature.flatten(0, 1)).view(num_center_objects, num_polylines, -1)
-        map_proj = map_proj * map_mask.unsqueeze(-1).type_as(map_proj)
+        obj_proj_valid = self.in_proj_obj(obj_feature[obj_mask])
+        obj_proj = obj_feature.new_zeros(num_center_objects, num_objects, obj_proj_valid.shape[-1])
+        obj_proj[obj_mask] = obj_proj_valid
+
+        map_proj_valid = self.in_proj_map(map_feature[map_mask])
+        map_proj = map_feature.new_zeros(num_center_objects, num_polylines, map_proj_valid.shape[-1])
+        map_proj[map_mask] = map_proj_valid
 
         obj_proj, pred_dense = self.apply_dense_future_prediction(obj_proj, obj_mask, obj_pos)
         center_type = input_dict.get("center_objects_type", input_dict.get("center_obj_type"))

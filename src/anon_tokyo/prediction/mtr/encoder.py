@@ -276,9 +276,6 @@ class MTREncoder(nn.Module):
 
         obj_last_pos = input_dict.get("obj_trajs_last_pos", input_dict.get("obj_positions"))
         map_center = input_dict["map_polylines_center"]
-        obj_pos_for_pe = obj_last_pos[..., 0:2]
-        map_pos_for_pe = map_center[..., 0:2]
-
         obj_in = torch.cat((obj_trajs, obj_trajs_mask[..., None].to(obj_trajs.dtype)), dim=-1)
         obj_feature = self.agent_polyline_encoder(obj_in, obj_trajs_mask)
         map_feature = self.map_polyline_encoder(map_polylines, map_polylines_mask)
@@ -287,7 +284,7 @@ class MTREncoder(nn.Module):
         map_valid_mask = map_polylines_mask.sum(dim=-1) > 0
         token_feature = torch.cat((obj_feature, map_feature), dim=1)
         token_mask = torch.cat((obj_valid_mask, map_valid_mask), dim=1)
-        token_pos = torch.cat((obj_pos_for_pe, map_pos_for_pe), dim=1)
+        token_pos = torch.cat((obj_last_pos, map_center), dim=1)
 
         if self.use_local_attn:
             token_feature = self.apply_local_attn(token_feature, token_mask, token_pos, self.num_attn_neighbors)

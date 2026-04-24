@@ -350,15 +350,15 @@ def _nll_loss_gmm_flat(
     log_std2 = winner_trajs[:, :, 3].clamp(*log_std_range)
     rho = winner_trajs[:, :, 4].clamp(-rho_limit, rho_limit)
 
-    std1 = log_std1.exp()
-    std2 = log_std2.exp()
-    one_minus_rho2 = (1 - rho * rho).clamp(min=1e-6)
+    std1 = torch.exp(log_std1)
+    std2 = torch.exp(log_std2)
 
-    log_coeff = log_std1 + log_std2 + 0.5 * one_minus_rho2.log()
-    z = dx * dx / (std1 * std1) + dy * dy / (std2 * std2) - 2 * rho * dx * dy / (std1 * std2)
-    nll = log_coeff + 0.5 * z / one_minus_rho2
+    reg_gmm_log_coefficient = log_std1 + log_std2 + 0.5 * torch.log(1 - rho**2)
+    reg_gmm_exp = (0.5 * 1 / (1 - rho**2)) * (
+        (dx**2) / (std1**2) + (dy**2) / (std2**2) - 2 * rho * dx * dy / (std1 * std2)
+    )
 
-    reg_loss = (nll * gt_mask).sum(dim=-1)
+    reg_loss = ((reg_gmm_log_coefficient + reg_gmm_exp) * gt_mask).sum(dim=-1)
 
     return reg_loss, winner_idx
 
@@ -476,7 +476,7 @@ def mtr_prediction_loss(
         loss_cls = F.cross_entropy(scores, positive_idx, reduction="none")
 
         # Official MTR builds a per-center loss vector, then averages it.
-        layer_loss = (w_reg * loss_reg + w_vel * loss_vel + w_cls * loss_cls).mean()
+        layer_loss = (w_reg * loss_reg + w_vel * loss_vel + w_cls * loss_cls.sum(dim=-1)).mean()
         total_decoder_loss = total_decoder_loss + layer_loss
 
         # Per-layer detailed logging (matches official tb_dict keys)
