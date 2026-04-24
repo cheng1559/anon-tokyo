@@ -59,13 +59,18 @@ def _apply_drope_batched(q: Tensor, k: Tensor, heading_q: Tensor, heading_k: Ten
 
 def _sinusoidal_pe(pos: Tensor, d_model: int) -> Tensor:
     """Fallback sinusoidal PE for ``[..., 2]`` coordinates → ``[..., d_model]``."""
-    half = d_model // 2
-    dim_t = torch.arange(half, dtype=torch.float32, device=pos.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / half)
+    if d_model % 2 != 0:
+        raise ValueError(f"Sinusoidal PE requires an even d_model, got {d_model}")
+
+    axis_dim = d_model // 2
+    dim_t = torch.arange(axis_dim, dtype=torch.float32, device=pos.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / axis_dim)
+
     x = pos[..., 0:1] / dim_t
     y = pos[..., 1:2] / dim_t
-    pe = torch.cat([x.sin(), x.cos(), y.sin(), y.cos()], dim=-1)
-    return pe[..., :d_model]
+    pos_x = torch.stack((x[..., 0::2].sin(), x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((y[..., 0::2].sin(), y[..., 1::2].cos()), dim=-1).flatten(-2)
+    return torch.cat((pos_y, pos_x), dim=-1)
 
 
 @torch.no_grad()

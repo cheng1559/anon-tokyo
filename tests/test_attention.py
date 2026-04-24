@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from anon_tokyo.nn.attention import SparseTopKAttention, select_topk
+from anon_tokyo.nn.attention import SparseTopKAttention, _sinusoidal_pe, select_topk
 
 
 B, N_Q, N_K, D, H, K = 2, 4, 16, 64, 8, 8
@@ -51,6 +51,15 @@ class TestSelectTopK:
 
 
 class TestSparseTopKAttention:
+    def test_sinusoidal_pe_uses_both_xy_coordinates(self) -> None:
+        pe_x0_y0 = _sinusoidal_pe(torch.tensor([[0.0, 0.0]]), D)
+        pe_x1_y0 = _sinusoidal_pe(torch.tensor([[1.0, 0.0]]), D)
+        pe_x0_y1 = _sinusoidal_pe(torch.tensor([[0.0, 1.0]]), D)
+
+        assert pe_x0_y0.shape == (1, D)
+        assert not torch.allclose(pe_x0_y0, pe_x1_y0)
+        assert not torch.allclose(pe_x0_y0, pe_x0_y1)
+
     def test_output_shape_rope_drope(self) -> None:
         layer = SparseTopKAttention(d_model=D, num_heads=H, sparse_k=K, use_rope=True, use_drope=True)
         q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k = _make_inputs()
