@@ -18,7 +18,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from anon_tokyo.nn.rope import apply_drope, apply_rope_2d
+def _apply_rope_2d_batched(q: Tensor, k: Tensor, pos_q: Tensor, pos_k: Tensor, base: float = 10000.0) -> tuple[Tensor, Tensor]:
+    """Vectorized 2-D RoPE for ``q [B,N,H,D]`` and ``k [B,N,K,H,D]``."""
+    d = q.shape[-1]
+    half = d // 2
+    idx = torch.arange(half // 2, device=q.device, dtype=torch.float32)
+    freqs = 1.0 / (base ** (2 * idx / half))
+
+    qx = pos_q[..., 0, None] * freqs
+    qy = pos_q[..., 1, None] * freqs
+    q_cos = torch.cat((qx.cos(), qy.cos()), dim=-1).unsqueeze(2)
+    q_sin = torch.cat((qx.sin(), qy.sin()), dim=-1).unsqueeze(2)
+
+    kx = pos_k[..., 0, None] * freqs
+    ky = pos_k[..., 1, None] * freqs
+    k_cos = torch.cat((kx.cos(), ky.cos()), dim=-1).unsqueeze(3)
+    k_sin = torch.cat((kx.sin(), ky.sin()), dim=-1).unsqueeze(3)
+
+    q1, q2 = q[..., :half], q[..., half:]
+    k1, k2 = k[..., :half], k[..., half:]
+    q_rot = torch.cat((q1 * q_cos - q2 * q_sin, q2 * q_cos + q1 * q_sin), dim=-1)
+    k_rot = torch.cat((k1 * k_cos - k2 * k_sin, k2 * k_cos + k1 * k_sin), dim=-1)
+    return q_rot, k_rot
+
+
+def _apply_drope_batched(q: Tensor, k: Tensor, heading_q: Tensor, heading_k: Tensor) -> tuple[Tensor, Tensor]:
+    """Vectorized heading DRoPE for ``q [B,N,H,D]`` and ``k [B,N,K,H,D]``."""
+    half = q.shape[-1] // 2
+    q_cos = heading_q.cos().unsqueeze(-1).unsqueeze(-1).expand(*q.shape[:-1], half)
+    q_sin = heading_q.sin().unsqueeze(-1).unsqueeze(-1).expand(*q.shape[:-1], half)
+    k_cos = heading_k.cos().unsqueeze(-1).unsqueeze(-1).expand(*k.shape[:-1], half)
+    k_sin = heading_k.sin().unsqueeze(-1).unsqueeze(-1).expand(*k.shape[:-1], half)
+
+    q1, q2 = q[..., :half], q[..., half:]
+    k1, k2 = k[..., :half], k[..., half:]
+    q_rot = torch.cat((q1 * q_cos - q2 * q_sin, q2 * q_cos + q1 * q_sin), dim=-1)
+    k_rot = torch.cat((k1 * k_cos - k2 * k_sin, k2 * k_cos + k1 * k_sin), dim=-1)
+    return q_rot, k_rot
 
 
 def _sinusoidal_pe(pos: Tensor, d_model: int) -> Tensor:
@@ -166,36 +202,26 @@ class SparseTopKAttention(nn.Module):
         V = V.reshape(B, N_q, actual_k, H, d_h)
 
         if self.position_encoding != "sine":
-            # Per-head RoPE / DRoPE
-            q_heads = []
-            k_heads = []
-            for h in range(H):
-                qh = Q[:, :, h, :]  # [B, N_q, d_h]
-                kh = K[:, :, :, h, :]  # [B, N_q, k, d_h]
+            Q_all = Q.unsqueeze(2)
+            K_all = K
+            if self.position_encoding == "rope":
+                Q_rot, K_all = _apply_rope_2d_batched(Q, K, pos_q, pos_k_gathered)
+                Q_all = Q_rot.unsqueeze(2)
+            elif self.position_encoding == "drope":
+                Q_rot, K_all = _apply_drope_batched(Q, K, heading_q, heading_k_gathered)
+                Q_all = Q_rot.unsqueeze(2)
+            else:
+                Q_enc = torch.empty_like(Q)
+                K_enc = torch.empty_like(K)
+                qr, kr = _apply_rope_2d_batched(Q[:, :, 0::2], K[:, :, :, 0::2], pos_q, pos_k_gathered)
+                Q_enc[:, :, 0::2] = qr
+                K_enc[:, :, :, 0::2] = kr
+                qd, kd = _apply_drope_batched(Q[:, :, 1::2], K[:, :, :, 1::2], heading_q, heading_k_gathered)
+                Q_enc[:, :, 1::2] = qd
+                K_enc[:, :, :, 1::2] = kd
+                Q_all = Q_enc.unsqueeze(2)
+                K_all = K_enc
 
-                if self.position_encoding == "rope" or (self.position_encoding == "rope_drope" and h % 2 == 0):
-                    pos_q_exp = pos_q  # [B, N_q, 2]
-                    pos_k_exp = pos_k_gathered  # [B, N_q, k, 2]
-                    qh_exp = qh.unsqueeze(2).expand_as(kh)  # [B, N_q, k, d_h]
-                    qh_rot, kh_rot = apply_rope_2d(qh_exp, kh, pos_q_exp.unsqueeze(2).expand_as(pos_k_exp), pos_k_exp)
-                    q_heads.append(qh_rot)
-                    k_heads.append(kh_rot)
-                elif self.position_encoding == "drope" or (self.position_encoding == "rope_drope" and h % 2 == 1):
-                    hd_q = heading_q  # [B, N_q]
-                    hd_k = heading_k_gathered  # [B, N_q, k]
-                    qh_exp = qh.unsqueeze(2).expand_as(kh)  # [B, N_q, k, d_h]
-                    qh_rot, kh_rot = apply_drope(qh_exp, kh, hd_q.unsqueeze(2).expand_as(hd_k), hd_k)
-                    q_heads.append(qh_rot)
-                    k_heads.append(kh_rot)
-                else:
-                    q_heads.append(qh.unsqueeze(2).expand_as(kh))
-                    k_heads.append(kh)
-
-            # Stack: [B, N_q, k, H, d_h]
-            Q_all = torch.stack(q_heads, dim=3)  # [B, N_q, k, H, d_h]
-            K_all = torch.stack(k_heads, dim=3)  # [B, N_q, k, H, d_h]
-
-            # Attention: element-wise dot across d_h, then sum → [B, N_q, k, H]
             attn_logits = (Q_all * K_all).sum(dim=-1) * self.scale  # [B, N_q, k, H]
         else:
             # Fallback: additive sinusoidal PE

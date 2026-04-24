@@ -200,6 +200,38 @@ class AnonTokyoDecoder(MTRDecoder):
             pred_scores = pred_scores_flat.view(B, K, self.num_motion_modes)
         return pred_scores, pred_trajs
 
+    @staticmethod
+    def _scatter_target_predictions(
+        pred_list_valid: list[list[Tensor]],
+        pred_scores_valid: Tensor,
+        pred_trajs_valid: Tensor,
+        intention_points_valid: Tensor,
+        valid_b: Tensor,
+        valid_k: Tensor,
+        batch_size: int,
+        num_targets: int,
+    ) -> tuple[list[tuple[Tensor, Tensor]], Tensor, Tensor, Tensor]:
+        pred_list: list[tuple[Tensor, Tensor]] = []
+        for scores_i, trajs_i in pred_list_valid:
+            q = scores_i.shape[2]
+            t = trajs_i.shape[3]
+            scores = scores_i.new_zeros(batch_size, num_targets, q)
+            trajs = trajs_i.new_zeros(batch_size, num_targets, q, t, trajs_i.shape[-1])
+            scores[valid_b, valid_k] = scores_i[:, 0]
+            trajs[valid_b, valid_k] = trajs_i[:, 0]
+            pred_list.append((scores, trajs))
+
+        m = pred_scores_valid.shape[2]
+        t = pred_trajs_valid.shape[3]
+        pred_scores = pred_scores_valid.new_zeros(batch_size, num_targets, m)
+        pred_trajs = pred_trajs_valid.new_zeros(batch_size, num_targets, m, t, pred_trajs_valid.shape[-1])
+        pred_scores[valid_b, valid_k] = pred_scores_valid[:, 0]
+        pred_trajs[valid_b, valid_k] = pred_trajs_valid[:, 0]
+
+        intention_points = intention_points_valid.new_zeros(batch_size, num_targets, intention_points_valid.shape[2], 2)
+        intention_points[valid_b, valid_k] = intention_points_valid[:, 0]
+        return pred_list, pred_scores, pred_trajs, intention_points
+
     def forward(self, enc_out: dict[str, Tensor], batch: dict[str, Tensor]) -> dict[str, Tensor]:
         self.forward_ret_dict = {}
 
@@ -226,33 +258,46 @@ class AnonTokyoDecoder(MTRDecoder):
 
         ttp = batch["tracks_to_predict"].long()
         K = ttp.shape[1]
-        ttp_clamped = ttp.clamp(min=0)
-        b_idx = torch.arange(B, device=obj_feature.device)[:, None].expand(B, K)
-        center_feature = center_feature[b_idx, ttp_clamped]
-        center_pos = obj_pos[b_idx, ttp_clamped]
-        center_heading = obj_heading[b_idx, ttp_clamped]
-        center_type = batch["obj_types"].long()[b_idx, ttp_clamped]
+        valid_b, valid_k = torch.nonzero(ttp >= 0, as_tuple=True)
+        if valid_b.numel() == 0:
+            valid_b = torch.zeros(1, dtype=torch.long, device=obj_feature.device)
+            valid_k = torch.zeros(1, dtype=torch.long, device=obj_feature.device)
+        valid_tidx = ttp[valid_b, valid_k].clamp(min=0)
+        center_feature_valid = center_feature[valid_b, valid_tidx].unsqueeze(1)
+        center_pos_valid = obj_pos[valid_b, valid_tidx].unsqueeze(1)
+        center_heading_valid = obj_heading[valid_b, valid_tidx].unsqueeze(1)
+        center_type_valid = batch["obj_types"].long()[valid_b, valid_tidx].unsqueeze(1)
 
-        pred_list = self.apply_transformer_decoder(
-            center_feature,
-            center_type,
-            center_pos,
-            center_heading,
-            obj_proj,
-            obj_mask,
-            obj_pos,
-            map_proj,
-            map_mask,
-            map_pos,
+        pred_list_valid = self.apply_transformer_decoder(
+            center_feature_valid,
+            center_type_valid,
+            center_pos_valid,
+            center_heading_valid,
+            obj_proj[valid_b],
+            obj_mask[valid_b],
+            obj_pos[valid_b],
+            map_proj[valid_b],
+            map_mask[valid_b],
+            map_pos[valid_b],
+        )
+        pred_scores_valid, pred_trajs_valid = self.generate_final_prediction(pred_list_valid)
+        pred_list, pred_scores, pred_trajs, intention_points = self._scatter_target_predictions(
+            pred_list_valid,
+            pred_scores_valid,
+            pred_trajs_valid,
+            self.forward_ret_dict["intention_points"],
+            valid_b,
+            valid_k,
+            B,
+            K,
         )
         self.forward_ret_dict["pred_list"] = pred_list
-        pred_scores, pred_trajs = self.generate_final_prediction(pred_list)
         return {
             "pred_scores": pred_scores if not self.training else pred_list[-1][0],
             "pred_trajs": pred_trajs if not self.training else pred_list[-1][1],
-            "pred_list": [(s, t) for s, t in pred_list],
+            "pred_list": pred_list,
             "pred_dense_trajs": pred_dense,
-            "intention_points": self.forward_ret_dict["intention_points"],
+            "intention_points": intention_points,
             "track_index_to_predict": ttp,
             "pred_is_target_agents": True,
         }
