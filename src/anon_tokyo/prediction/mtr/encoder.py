@@ -255,7 +255,7 @@ class MTREncoder(nn.Module):
             )
 
         ret = torch.zeros_like(x_full)
-        ret[mask_full] = output
+        ret[mask_full] = output.to(dtype=ret.dtype)
         return ret.reshape(batch_size, n_token, d_model)
 
     def apply_global_attn(self, x: Tensor, x_mask: Tensor, x_pos: Tensor) -> Tensor:

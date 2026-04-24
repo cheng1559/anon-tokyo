@@ -113,14 +113,14 @@ class TransformerDecoderLayer(nn.Module):
             valid_memory = memory[memory_valid_mask]
             k_content_valid = self.ca_kcontent_proj(valid_memory)
             k_content = memory.new_zeros(memory.shape[0], k_content_valid.shape[-1])
-            k_content[memory_valid_mask] = k_content_valid
+            k_content[memory_valid_mask] = k_content_valid.to(dtype=k_content.dtype)
             v_valid = self.ca_v_proj(valid_memory)
             v = memory.new_zeros(memory.shape[0], v_valid.shape[-1])
-            v[memory_valid_mask] = v_valid
+            v[memory_valid_mask] = v_valid.to(dtype=v.dtype)
             valid_pos = pos[memory_valid_mask]
             k_pos_valid = self.ca_kpos_proj(valid_pos)
             k_pos = pos.new_zeros(memory.shape[0], k_pos_valid.shape[-1])
-            k_pos[memory_valid_mask] = k_pos_valid
+            k_pos[memory_valid_mask] = k_pos_valid.to(dtype=k_pos.dtype)
         else:
             k_content = self.ca_kcontent_proj(memory)
             v = self.ca_v_proj(memory)
@@ -332,9 +332,9 @@ class MTRDecoder(nn.Module):
         future_feature = self.future_traj_mlps(future_input)
         obj_feature_valid = self.traj_fusion_mlps(torch.cat((obj_feature_valid, future_feature), dim=-1))
         ret_feature = torch.zeros_like(obj_feature)
-        ret_feature[valid] = obj_feature_valid
+        ret_feature[valid] = obj_feature_valid.to(dtype=ret_feature.dtype)
         ret_dense = obj_feature.new_zeros(num_center_objects, num_objects, self.num_future_frames, 7)
-        ret_dense[valid] = pred_dense
+        ret_dense[valid] = pred_dense.to(dtype=ret_dense.dtype)
         self.forward_ret_dict["pred_dense_trajs"] = ret_dense
         return ret_feature, ret_dense
 
