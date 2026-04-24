@@ -1,4 +1,4 @@
-"""Export model predictions to pickle for WOMD evaluation.
+"""Export model predictions to NPZ for WOMD evaluation.
 
 Step 1 of the evaluation pipeline. Runs in the main venv (with torch).
 Loads a checkpoint, runs inference on validation/testing data, transforms
@@ -9,14 +9,13 @@ Usage:
         --config configs/prediction/mtr_baseline.yaml \
         --ckpt checkpoints/last.ckpt \
         --split validation \
-        --output predictions.pkl
+        --output predictions.npz
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
-import pickle
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +33,7 @@ INT_TO_WOMD_TYPE: dict[int, str] = {
     2: "TYPE_PEDESTRIAN",
     3: "TYPE_CYCLIST",
 }
+WOMD_TYPE_TO_INT: dict[str, int] = {v: k for k, v in INT_TO_WOMD_TYPE.items()}
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", required=True, help="Training config YAML")
     p.add_argument("--ckpt", required=True, help="Checkpoint path")
     p.add_argument("--split", default="validation", choices=["validation", "testing"])
-    p.add_argument("--output", default="predictions.pkl")
+    p.add_argument("--output", default="predictions.npz")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
@@ -244,6 +244,47 @@ def _process_scene_centric(
     return results
 
 
+def _save_predictions_npz(preds: list[dict], out_path: Path) -> None:
+    if out_path.suffix != ".npz":
+        raise ValueError(f"Prediction output must be a .npz file, got: {out_path}")
+    if not preds:
+        raise ValueError("No predictions to save")
+
+    pred_trajs = np.stack([p["pred_trajs"] for p in preds]).astype(np.float32, copy=False)
+    pred_scores = np.stack([p["pred_scores"] for p in preds]).astype(np.float32, copy=False)
+
+    first_gt = np.asarray(preds[0]["gt_trajs"])
+    num_gt_frames = first_gt.shape[0]
+    gt_trajectory = np.empty((len(preds), num_gt_frames, 7), dtype=np.float32)
+    gt_is_valid = np.empty((len(preds), num_gt_frames), dtype=np.bool_)
+    object_id = np.empty(len(preds), dtype=np.int64)
+    object_type = np.empty(len(preds), dtype=np.int64)
+    track_index_to_predict = np.empty(len(preds), dtype=np.int32)
+    scenario_id = np.empty(len(preds), dtype=f"U{max(len(str(p['scenario_id'])) for p in preds)}")
+
+    for i, pred in enumerate(preds):
+        raw_gt = np.asarray(pred["gt_trajs"])
+        gt_trajectory[i] = raw_gt[:, [0, 1, 3, 4, 6, 7, 8]]
+        gt_is_valid[i] = raw_gt[:, -1].astype(bool)
+        object_id[i] = int(pred["object_id"])
+        object_type[i] = WOMD_TYPE_TO_INT.get(str(pred["object_type"]), 0)
+        track_index_to_predict[i] = int(pred["track_index_to_predict"])
+        scenario_id[i] = str(pred["scenario_id"])
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out_path,
+        scenario_id=scenario_id,
+        object_id=object_id,
+        object_type=object_type,
+        track_index_to_predict=track_index_to_predict,
+        pred_trajs=pred_trajs,
+        pred_scores=pred_scores,
+        gt_trajectory=gt_trajectory,
+        gt_is_valid=gt_is_valid,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -294,17 +335,8 @@ def main() -> None:
         fn = _process_agent_centric if is_ac else _process_scene_centric
         all_preds.extend(fn(output, batch, npz_root, args.device))
 
-    # Convert numpy arrays to plain lists so the pickle is readable
-    # by the older numpy (1.x) in .venv-scripts.
-    for d in all_preds:
-        for k, v in d.items():
-            if isinstance(v, np.ndarray):
-                d[k] = v.tolist()
-
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump(all_preds, f)
+    _save_predictions_npz(all_preds, out_path)
     print(f"Saved {len(all_preds)} predictions to {out_path}")
 
 

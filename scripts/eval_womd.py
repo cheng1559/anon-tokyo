@@ -4,7 +4,7 @@ Step 2 of the evaluation pipeline. Runs in .venv-scripts (TF + waymo SDK).
 
 Usage:
     .venv-scripts/bin/python scripts/eval_womd.py \
-        --predictions predictions.pkl \
+        --predictions predictions.npz \
         --eval_second 8 \
         --num_modes 6
 """
@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import pickle
 import sys
 
 import numpy as np
@@ -28,7 +27,7 @@ except ImportError:
     print(
         "ERROR: tensorflow / waymo-open-dataset not found.\n"
         "Run this script in .venv-scripts:\n"
-        "  .venv-scripts/bin/python scripts/eval_womd.py --predictions predictions.pkl",
+        "  .venv-scripts/bin/python scripts/eval_womd.py --predictions predictions.npz",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -45,11 +44,12 @@ OBJECT_TYPE_TO_ID = {
     "TYPE_CYCLIST": 3,
     "TYPE_OTHER": 4,
 }
+ID_TO_OBJECT_TYPE = {v: k for k, v in OBJECT_TYPE_TO_ID.items()}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="WOMD evaluation")
-    p.add_argument("--predictions", required=True, help="Path to predictions.pkl")
+    p.add_argument("--predictions", required=True, help="Path to predictions.npz")
     p.add_argument("--eval_second", type=int, default=8, choices=[3, 5, 8])
     p.add_argument("--num_modes", type=int, default=6)
     return p.parse_args()
@@ -101,29 +101,25 @@ def _default_metrics_config(eval_second: int, num_modes: int = 6) -> motion_metr
     return config
 
 
-def transform_preds_to_waymo_format(
-    pred_dicts: list[dict], top_k: int = -1, eval_second: int = 8
+def transform_npz_to_waymo_format(
+    pred_npz: np.lib.npyio.NpzFile, top_k: int = -1, eval_second: int = 8
 ) -> tuple[np.ndarray, np.ndarray, dict, dict]:
-    """Convert prediction dicts to arrays expected by WOMD metrics op."""
-    # Flatten nested lists if any
-    flat: list[dict] = []
-    for item in pred_dicts:
-        if isinstance(item, list):
-            flat.extend(item)
-        else:
-            flat.append(item)
-    pred_dicts = flat
-    print(f"Total predictions: {len(pred_dicts)}")
+    """Convert exported NPZ arrays to arrays expected by WOMD metrics op."""
+    scenario_ids_flat = pred_npz["scenario_id"]
+    pred_trajs_flat = pred_npz["pred_trajs"]
+    pred_scores_flat = pred_npz["pred_scores"]
+    gt_trajectory_flat = pred_npz["gt_trajectory"]
+    gt_is_valid_flat = pred_npz["gt_is_valid"]
+    object_type_flat = pred_npz["object_type"]
+    object_id_flat = pred_npz["object_id"]
 
-    # Group by scenario
-    scene2preds: dict[str, list[dict]] = {}
-    for pd in pred_dicts:
-        sid = pd["scenario_id"]
-        scene2preds.setdefault(sid, []).append(pd)
+    print(f"Total predictions: {len(pred_trajs_flat)}")
 
-    num_scenario = len(scene2preds)
-    max_objs = max(len(v) for v in scene2preds.values())
-    topK, num_future_frames, _ = pred_dicts[0]["pred_trajs"].shape
+    unique_sids, scene_inverse = np.unique(scenario_ids_flat, return_inverse=True)
+    num_scenario = len(unique_sids)
+    scene_counts = np.bincount(scene_inverse, minlength=num_scenario)
+    max_objs = int(scene_counts.max())
+    topK, _, _ = pred_trajs_flat.shape[1:]
 
     if top_k > 0:
         topK = min(top_k, topK)
@@ -139,48 +135,47 @@ def transform_preds_to_waymo_format(
         num_frames_total = 91
         num_frame_eval = 16
 
-    batch_pred_trajs = np.zeros((num_scenario, max_objs, topK, 1, num_frame_eval, 2))
-    batch_pred_scores = np.zeros((num_scenario, max_objs, topK))
-    gt_trajs = np.zeros((num_scenario, max_objs, num_frames_total, 7))
+    batch_pred_trajs = np.zeros((num_scenario, max_objs, topK, 1, num_frame_eval, 2), dtype=np.float32)
+    batch_pred_scores = np.zeros((num_scenario, max_objs, topK), dtype=np.float32)
+    gt_trajs = np.zeros((num_scenario, max_objs, num_frames_total, 7), dtype=np.float32)
     gt_is_valid = np.zeros((num_scenario, max_objs, num_frames_total), dtype=int)
     pred_gt_idxs = np.zeros((num_scenario, max_objs, 1))
     pred_gt_idx_mask = np.zeros((num_scenario, max_objs, 1), dtype=int)
-    object_type = np.zeros((num_scenario, max_objs), dtype=object)
+    object_type = np.zeros((num_scenario, max_objs), dtype=np.int64)
     object_id = np.zeros((num_scenario, max_objs), dtype=int)
-    scenario_id = np.zeros(num_scenario, dtype=object)
 
     type_cnt: dict[str, int] = {k: 0 for k in OBJECT_TYPE_TO_ID}
+    obj_offsets = np.zeros(num_scenario, dtype=np.int64)
 
-    for scene_idx, (sid, preds) in enumerate(scene2preds.items()):
-        scenario_id[scene_idx] = sid
-        for obj_idx, pred in enumerate(preds):
-            # Sort by score descending, renormalise
-            sort_idx = pred["pred_scores"].argsort()[::-1]
-            scores = pred["pred_scores"][sort_idx]
-            trajs = pred["pred_trajs"][sort_idx]
-            scores = scores / scores.sum()
+    for i in range(len(pred_trajs_flat)):
+        scene_idx = scene_inverse[i]
+        obj_idx = obj_offsets[scene_idx]
+        obj_offsets[scene_idx] += 1
 
-            # Sample at 2 Hz: indices 4, 9, 14, ...
-            sampled = trajs[:topK, np.newaxis, 4::sampled_interval, :][:, :, :num_frame_eval, :]
-            batch_pred_trajs[scene_idx, obj_idx] = sampled
-            batch_pred_scores[scene_idx, obj_idx] = scores[:topK]
+        sort_idx = pred_scores_flat[i].argsort()[::-1]
+        scores = pred_scores_flat[i, sort_idx]
+        trajs = pred_trajs_flat[i, sort_idx]
+        scores = scores / scores.sum()
 
-            # GT: [cx, cy, dx, dy, heading, vx, vy]
-            raw_gt = pred["gt_trajs"][:num_frames_total]
-            gt_trajs[scene_idx, obj_idx] = raw_gt[:, [0, 1, 3, 4, 6, 7, 8]]
-            gt_is_valid[scene_idx, obj_idx] = raw_gt[:, -1].astype(int)
+        sampled = trajs[:topK, np.newaxis, 4::sampled_interval, :][:, :, :num_frame_eval, :]
+        batch_pred_trajs[scene_idx, obj_idx] = sampled
+        batch_pred_scores[scene_idx, obj_idx] = scores[:topK]
 
-            pred_gt_idxs[scene_idx, obj_idx, 0] = obj_idx
-            pred_gt_idx_mask[scene_idx, obj_idx, 0] = 1
-            obj_type_str = pred["object_type"]
-            object_type[scene_idx, obj_idx] = OBJECT_TYPE_TO_ID.get(obj_type_str, 0)
-            object_id[scene_idx, obj_idx] = pred["object_id"]
+        gt_trajs[scene_idx, obj_idx] = gt_trajectory_flat[i, :num_frames_total]
+        gt_is_valid[scene_idx, obj_idx] = gt_is_valid_flat[i, :num_frames_total].astype(int)
 
-            if obj_type_str in type_cnt:
-                type_cnt[obj_type_str] += 1
+        pred_gt_idxs[scene_idx, obj_idx, 0] = obj_idx
+        pred_gt_idx_mask[scene_idx, obj_idx, 0] = 1
+        obj_type_int = int(object_type_flat[i])
+        object_type[scene_idx, obj_idx] = obj_type_int
+        object_id[scene_idx, obj_idx] = int(object_id_flat[i])
+
+        obj_type_str = ID_TO_OBJECT_TYPE.get(obj_type_int, "TYPE_UNSET")
+        if obj_type_str in type_cnt:
+            type_cnt[obj_type_str] += 1
 
     gt_infos = {
-        "scenario_id": scenario_id.tolist(),
+        "scenario_id": unique_sids.tolist(),
         "object_id": object_id.tolist(),
         "object_type": object_type.tolist(),
         "gt_is_valid": gt_is_valid,
@@ -192,13 +187,13 @@ def transform_preds_to_waymo_format(
 
 
 def waymo_evaluation(
-    pred_dicts: list[dict],
+    pred_npz: np.lib.npyio.NpzFile,
     top_k: int = -1,
     eval_second: int = 8,
     num_modes: int = 6,
 ) -> tuple[dict, str]:
-    pred_score, pred_traj, gt_infos, type_cnt = transform_preds_to_waymo_format(
-        pred_dicts, top_k=top_k, eval_second=eval_second
+    pred_score, pred_traj, gt_infos, type_cnt = transform_npz_to_waymo_format(
+        pred_npz, top_k=top_k, eval_second=eval_second
     )
     eval_config = _default_metrics_config(eval_second, num_modes)
 
@@ -272,19 +267,11 @@ def waymo_evaluation(
 def main() -> None:
     args = parse_args()
 
-    with open(args.predictions, "rb") as f:
-        pred_dicts = pickle.load(f)
-
-    # Restore lists back to numpy arrays
-    for d in pred_dicts:
-        for k in ("pred_trajs", "pred_scores", "gt_trajs"):
-            if k in d and isinstance(d[k], list):
-                d[k] = np.array(d[k], dtype=np.float32)
-
-    print(f"Loaded {len(pred_dicts)} predictions from {args.predictions}")
+    pred_npz = np.load(args.predictions, allow_pickle=False)
+    print(f"Loaded predictions from {args.predictions}")
 
     result_dict, result_str = waymo_evaluation(
-        pred_dicts,
+        pred_npz,
         eval_second=args.eval_second,
         num_modes=args.num_modes,
     )

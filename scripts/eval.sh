@@ -4,19 +4,19 @@
 #   Step 2: Compute WOMD metrics (.venv-scripts, TF + waymo SDK)
 #
 # Usage:
-#   bash scripts/eval.sh <config> <ckpt> [split] [output_pkl]
+#   bash scripts/eval.sh <config> <ckpt> [split] [output_npz]
 #
 # Examples:
 #   bash scripts/eval.sh configs/prediction/mtr_baseline.yaml checkpoints/last.ckpt
-#   bash scripts/eval.sh configs/prediction/mtr_baseline.yaml checkpoints/last.ckpt validation results/pred.pkl
+#   bash scripts/eval.sh configs/prediction/mtr_baseline.yaml checkpoints/last.ckpt validation results/pred.npz
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CONFIG="${1:?Usage: eval.sh <config> <ckpt> [split] [output_pkl]}"
-CKPT="${2:?Usage: eval.sh <config> <ckpt> [split] [output_pkl]}"
+CONFIG="${1:?Usage: eval.sh <config> <ckpt> [split] [output_npz]}"
+CKPT="${2:?Usage: eval.sh <config> <ckpt> [split] [output_npz]}"
 SPLIT="${3:-validation}"
-OUTPUT="${4:-predictions.pkl}"
+OUTPUT="${4:-predictions.npz}"
 
 echo "=== Step 1: Export predictions (main venv) ==="
 uv run python scripts/export_predictions.py \
