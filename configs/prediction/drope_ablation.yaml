@@ -44,7 +44,7 @@ model:
       num_intention_queries: 64
       num_future_frames: 80
       position_encoding: sine
-      intention_points_file: reference-code/mtr/data/waymo/cluster_64_center_dict.pkl
+      intention_points_file: assets/mtr/cluster_64_center_dict.pkl
       center_offset_of_map: [30.0, 0.0]
       num_base_map_polylines: 256
       num_waypoint_map_polylines: 128

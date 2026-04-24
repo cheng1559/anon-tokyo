@@ -95,6 +95,7 @@ class TransformerEncoderLayer(nn.Module):
                 query_batch_cnt=query_batch_cnt,
                 key_batch_cnt=key_batch_cnt,
                 index_pair_batch=index_pair_batch,
+                local_indices=True,
             )[0]
             src = src + self.dropout1(src2)
             src2 = self.norm2(src)
@@ -112,6 +113,7 @@ class TransformerEncoderLayer(nn.Module):
             query_batch_cnt=query_batch_cnt,
             key_batch_cnt=key_batch_cnt,
             index_pair_batch=index_pair_batch,
+            local_indices=True,
         )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)

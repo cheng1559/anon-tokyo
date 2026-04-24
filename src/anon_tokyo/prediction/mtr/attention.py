@@ -1,14 +1,54 @@
-"""Pure PyTorch replacements for MTR's custom CUDA attention operators."""
+"""MTR-compatible attention with optional official CUDA operators."""
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.init import constant_, xavier_uniform_
+
+
+_OFFICIAL_KNN_BATCH_MLOGK = None
+_OFFICIAL_ATTENTION_WEIGHT = None
+_OFFICIAL_ATTENTION_VALUE = None
+
+
+def _load_official_cuda_ops() -> None:
+    global _OFFICIAL_KNN_BATCH_MLOGK, _OFFICIAL_ATTENTION_WEIGHT, _OFFICIAL_ATTENTION_VALUE
+    if os.environ.get("ANON_TOKYO_DISABLE_MTR_CUDA_OPS"):
+        return
+    if _OFFICIAL_KNN_BATCH_MLOGK is not None and _OFFICIAL_ATTENTION_WEIGHT is not None:
+        return
+
+    try:
+        from anon_tokyo.prediction.mtr.ops.attention.attention_utils_v2 import (
+            attention_value_computation,
+            attention_weight_computation,
+        )
+        from anon_tokyo.prediction.mtr.ops.knn.knn_utils import knn_batch_mlogk as official_knn_batch_mlogk
+    except Exception:
+        return
+
+    _OFFICIAL_KNN_BATCH_MLOGK = official_knn_batch_mlogk
+    _OFFICIAL_ATTENTION_WEIGHT = attention_weight_computation
+    _OFFICIAL_ATTENTION_VALUE = attention_value_computation
+
+
+def cuda_ops_available() -> bool:
+    _load_official_cuda_ops()
+    return _OFFICIAL_KNN_BATCH_MLOGK is not None and _OFFICIAL_ATTENTION_WEIGHT is not None
+
+
+def _as_knn_xyz3(pos: Tensor) -> Tensor:
+    if pos.shape[-1] >= 3:
+        return pos[..., :3].contiguous()
+    if pos.shape[-1] == 2:
+        return F.pad(pos, (0, 1)).contiguous()
+    raise ValueError(f"KNN positions must have at least 2 coordinates, got shape {tuple(pos.shape)}")
 
 
 def knn_batch_mlogk(
@@ -21,9 +61,27 @@ def knn_batch_mlogk(
     """MTR-compatible batched KNN implemented with ``torch.cdist``.
 
     Args mirror ``mtr.ops.knn.knn_utils.knn_batch_mlogk``. Returned indices
-    are global row indices into ``xyz`` with ``-1`` padding when a batch has
-    fewer than ``k`` keys.
+    are local row indices within each batch with ``-1`` padding when a batch
+    has fewer than ``k`` keys.
     """
+    _load_official_cuda_ops()
+    if (
+        _OFFICIAL_KNN_BATCH_MLOGK is not None
+        and xyz.is_cuda
+        and query_xyz.is_cuda
+        and batch_idxs.is_cuda
+        and query_batch_offsets.is_cuda
+        and xyz.shape[0] == query_xyz.shape[0]
+        and k <= 128
+    ):
+        return _OFFICIAL_KNN_BATCH_MLOGK(
+            _as_knn_xyz3(xyz),
+            _as_knn_xyz3(query_xyz),
+            batch_idxs.int().contiguous(),
+            query_batch_offsets.int().contiguous(),
+            k,
+        )
+
     n_query = query_xyz.shape[0]
     out = torch.full((n_query, k), -1, dtype=torch.int32, device=query_xyz.device)
     if n_query == 0 or xyz.shape[0] == 0 or k <= 0:
@@ -43,7 +101,7 @@ def knn_batch_mlogk(
         n_take = min(k, key_idx.numel())
         dist = torch.cdist(query_xyz[q_start:q_end, :2], xyz[key_idx, :2])
         _, local_idx = dist.topk(n_take, dim=-1, largest=False)
-        out[q_start:q_end, :n_take] = key_idx[local_idx].to(torch.int32)
+        out[q_start:q_end, :n_take] = local_idx.to(torch.int32)
     return out
 
 
@@ -213,8 +271,54 @@ class MultiheadAttentionLocal(nn.Module):
         invalid = index_pair < 0
         if attn_mask is not None:
             invalid = invalid | attn_mask.bool()
+        if local_indices and index_pair_batch is not None and key_batch_cnt is not None:
+            max_local_index = key_batch_cnt.long()[index_pair_batch.long()].to(index_pair.device)
+            invalid = invalid | (index_pair >= max_local_index[:, None])
         all_invalid = invalid.all(dim=-1)
         safe_pair = index_pair.clamp(min=0).long()
+
+        _load_official_cuda_ops()
+        if (
+            _OFFICIAL_ATTENTION_WEIGHT is not None
+            and _OFFICIAL_ATTENTION_VALUE is not None
+            and q.is_cuda
+            and k.is_cuda
+            and v.is_cuda
+            and local_indices
+            and query_batch_cnt is not None
+            and key_batch_cnt is not None
+            and index_pair_batch is not None
+        ):
+            original_dtype = q.dtype
+            index_pair_for_op = index_pair.masked_fill(invalid, -1).int().contiguous()
+            q_cnt = query_batch_cnt.int().contiguous()
+            k_cnt = key_batch_cnt.int().contiguous()
+            pair_batch = index_pair_batch.int().contiguous()
+            weights = _OFFICIAL_ATTENTION_WEIGHT(
+                q_cnt,
+                k_cnt,
+                pair_batch,
+                index_pair_for_op,
+                q.float().contiguous(),
+                k.float().contiguous(),
+            )
+            weights = weights.masked_fill(index_pair_for_op[..., None] < 0, float("-inf"))
+            if all_invalid.any():
+                weights[all_invalid] = 0.0
+            weights = F.softmax(weights, dim=1)
+            weights = F.dropout(weights, p=self.dropout, training=self.training)
+            weights = weights.masked_fill(index_pair_for_op[..., None] < 0, 0.0).contiguous()
+            out = _OFFICIAL_ATTENTION_VALUE(
+                q_cnt,
+                k_cnt,
+                pair_batch,
+                index_pair_for_op,
+                weights,
+                v.float().contiguous(),
+            )
+            out = out.reshape(total_query_len, vdim).to(original_dtype)
+            out = self.out_proj(out)
+            return out, weights.sum(dim=-1).to(out.dtype) / self.num_heads
 
         if (
             query_batch_cnt is not None
