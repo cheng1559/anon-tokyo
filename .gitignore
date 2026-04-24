@@ -15,6 +15,7 @@ data/raw
 data/processed
 data/shards
 *.pkl
+*.npz
 
 # Training outputs
 outputs/
