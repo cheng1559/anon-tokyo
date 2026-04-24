@@ -178,38 +178,68 @@ def _process_scene_centric(
     center_heading = batch["center_heading"]
     results: list[dict] = []
 
-    for b in range(B):
-        scenario_id = batch["scenario_id"][b]
-        raw = np.load(str(npz_root / f"{scenario_id}.npz"), allow_pickle=False)
-        raw_ttp = raw["tracks_to_predict"]
+    valid_b, valid_k = torch.nonzero(ttp >= 0, as_tuple=True)
+    if valid_b.numel() == 0:
+        return results
 
-        for ki in range(K):
-            if ttp[b, ki].item() < 0:
-                continue
-            ti = int(ttp[b, ki].item())
+    valid_tidx = ttp[valid_b, valid_k].long()
+    pred_agent_idx = valid_k if bool(output.get("pred_is_target_agents", False)) else valid_tidx
 
-            a_pos = batch["obj_positions"][b, ti].to(device)
-            a_head = batch["obj_headings"][b, ti].to(device)
-            c_xy = center_xy[b].to(device)
-            c_head = center_heading[b].to(device)
+    out_device = pred_trajs_all.device
+    valid_b_dev = valid_b.to(out_device)
+    pred_agent_idx_dev = pred_agent_idx.to(out_device)
 
-            pred_agent_idx = ki if bool(output.get("pred_is_target_agents", False)) else ti
-            pred_xy = pred_trajs_all[b, pred_agent_idx, :, :, 0:2]
-            pred_scores = pred_scores_all[b, pred_agent_idx]
-            world_xy = _rotate_to_world(pred_xy, a_head, a_pos, c_head, c_xy)
+    pred_xy = pred_trajs_all[valid_b_dev, pred_agent_idx_dev, :, :, 0:2]
+    pred_scores = pred_scores_all[valid_b_dev, pred_agent_idx_dev]
 
-            raw_idx = int(raw_ttp[ki])
-            results.append(
-                {
-                    "scenario_id": scenario_id,
-                    "pred_trajs": world_xy.cpu().numpy(),
-                    "pred_scores": pred_scores.cpu().numpy(),
-                    "object_id": int(raw["object_id"][raw_idx]),
-                    "object_type": INT_TO_WOMD_TYPE.get(int(raw["object_type"][raw_idx]), "TYPE_UNSET"),
-                    "gt_trajs": raw["trajs"][raw_idx],
-                    "track_index_to_predict": ki,
-                }
-            )
+    a_pos = batch["obj_positions"][valid_b, valid_tidx].to(device)
+    a_head = batch["obj_headings"][valid_b, valid_tidx].to(device)
+    c_xy = center_xy[valid_b].to(device)
+    c_head = center_heading[valid_b].to(device)
+
+    world_xy = _rotate_to_world(
+        pred_xy,
+        a_head[:, None, None],
+        a_pos[:, None, None, :],
+        c_head[:, None, None],
+        c_xy[:, None, None, :],
+    )
+    world_xy_np = world_xy.cpu().numpy()
+    pred_scores_np = pred_scores.cpu().numpy()
+
+    valid_b_np = valid_b.numpy()
+    valid_k_np = valid_k.numpy()
+    has_eval_meta = all(k in batch for k in ("eval_object_id", "eval_object_type", "eval_gt_trajs"))
+    raw_by_batch: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    if not has_eval_meta:
+        for b in range(B):
+            scenario_id = batch["scenario_id"][b]
+            raw = np.load(str(npz_root / f"{scenario_id}.npz"), allow_pickle=False)
+            raw_by_batch[b] = (raw["tracks_to_predict"], raw["object_id"], raw["object_type"], raw["trajs"])
+
+    for i, (b, ki) in enumerate(zip(valid_b_np, valid_k_np, strict=True)):
+        scenario_id = batch["scenario_id"][int(b)]
+        if has_eval_meta:
+            object_id = int(batch["eval_object_id"][b, ki])
+            object_type = int(batch["eval_object_type"][b, ki])
+            gt_trajs = batch["eval_gt_trajs"][b, ki].numpy()
+        else:
+            raw_ttp, raw_object_id, raw_object_type, raw_trajs = raw_by_batch[int(b)]
+            raw_idx = int(raw_ttp[int(ki)])
+            object_id = int(raw_object_id[raw_idx])
+            object_type = int(raw_object_type[raw_idx])
+            gt_trajs = raw_trajs[raw_idx]
+        results.append(
+            {
+                "scenario_id": scenario_id,
+                "pred_trajs": world_xy_np[i],
+                "pred_scores": pred_scores_np[i],
+                "object_id": object_id,
+                "object_type": INT_TO_WOMD_TYPE.get(object_type, "TYPE_UNSET"),
+                "gt_trajs": gt_trajs,
+                "track_index_to_predict": int(ki),
+            }
+        )
 
     return results
 
@@ -240,6 +270,7 @@ def main() -> None:
         use_npz=data_cfg.get("use_npz", False),
         npz_root=data_cfg.get("npz_root"),
         transform=data_cfg.get("transform", "scene"),
+        include_eval_meta=data_cfg.get("transform", "scene") != "mtr_official",
     )
     stage = "validate" if args.split == "validation" else "test"
     dm.setup(stage)
@@ -251,7 +282,7 @@ def main() -> None:
         if isinstance(x, Tensor):
             return x.to(args.device)
         if isinstance(x, dict):
-            return {k: to_device(v) for k, v in x.items()}
+            return {k: v if k.startswith("eval_") else to_device(v) for k, v in x.items()}
         return x
 
     for batch in tqdm(dataloader, desc="Predicting"):

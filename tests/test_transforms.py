@@ -111,6 +111,16 @@ class TestSceneCentricTransform:
         assert len(valid) == 2
         assert np.all(valid < 32)
 
+    def test_eval_meta_optional(self) -> None:
+        data = _make_scenario()
+        out = scene_centric_transform(data, max_agents=32, max_polylines=64, include_eval_meta=True)
+        assert out["eval_object_id"].shape == (8,)
+        assert out["eval_object_type"].shape == (8,)
+        assert out["eval_gt_trajs"].shape == (8, 91, 10)
+        np.testing.assert_array_equal(out["eval_object_id"][:2], data["object_id"][data["tracks_to_predict"]])
+        np.testing.assert_array_equal(out["eval_object_type"][:2], data["object_type"][data["tracks_to_predict"]])
+        np.testing.assert_allclose(out["eval_gt_trajs"][:2], data["trajs"][data["tracks_to_predict"]])
+
     def test_masked_features_zero(self) -> None:
         out = scene_centric_transform(_make_scenario(), max_agents=32, max_polylines=64)
         invalid = out["obj_trajs_mask"] == 0

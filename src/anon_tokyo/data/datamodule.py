@@ -37,6 +37,7 @@ class WOMDDataModule(L.LightningDataModule):
         use_npz: bool = False,
         npz_root: str | None = None,
         transform: str = "scene",
+        include_eval_meta: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -51,6 +52,7 @@ class WOMDDataModule(L.LightningDataModule):
             use_npz=use_npz,
             npz_root=npz_root,
             transform=transform,
+            include_eval_meta=include_eval_meta,
         )
         self.transform = transform
 

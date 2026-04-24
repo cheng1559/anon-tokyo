@@ -73,6 +73,7 @@ def scene_centric_transform(
     max_polylines: int = 4096,
     num_points_per_polyline: int = 20,
     vector_break_dist: float = 1.0,
+    include_eval_meta: bool = False,
 ) -> dict[str, np.ndarray]:
     """Transform a raw scenario dict into scene-centric padded features."""
 
@@ -238,7 +239,7 @@ def scene_centric_transform(
     map_element_mask = np.zeros(M, dtype=np.float32)
     map_element_mask[:num_polys] = 1.0
 
-    return {
+    out = {
         # Agents
         "obj_trajs": p_hist,  # (A, T_hist, 10)
         "obj_trajs_mask": p_hist_mask,  # (A, T_hist)
@@ -264,3 +265,24 @@ def scene_centric_transform(
         "center_xy": center_xy.astype(np.float32),
         "center_heading": np.float32(center_heading),
     }
+
+    if include_eval_meta:
+        eval_object_id = np.zeros(K, dtype=np.int64)
+        eval_object_type = np.zeros(K, dtype=np.int32)
+        eval_gt_trajs = np.zeros((K, num_timestamps, trajs.shape[-1]), dtype=np.float32)
+        eval_raw_track_index = np.full(K, -1, dtype=np.int32)
+        raw_eval_tracks = tracks_to_predict[:nk]
+        eval_raw_track_index[:nk] = raw_eval_tracks
+        eval_object_id[:nk] = data["object_id"][raw_eval_tracks].astype(np.int64)
+        eval_object_type[:nk] = obj_types[raw_eval_tracks].astype(np.int32)
+        eval_gt_trajs[:nk] = trajs[raw_eval_tracks].astype(np.float32)
+        out.update(
+            {
+                "eval_object_id": eval_object_id,
+                "eval_object_type": eval_object_type,
+                "eval_gt_trajs": eval_gt_trajs,
+                "eval_raw_track_index": eval_raw_track_index,
+            }
+        )
+
+    return out
