@@ -205,6 +205,25 @@ class PredictionModule(L.LightningModule):
                     batch_size=B,
                 )
 
+            if "pred_list" in output:
+                raw_scores, raw_trajs = output["pred_list"][-1]
+                raw_trajs = _gather_scene_tracks(raw_trajs, batch, output)
+                raw_scores = _gather_scene_tracks(raw_scores, batch, output)
+                raw_metrics = compute_prediction_metrics(
+                    raw_trajs[:, :, :, :, 0:2],
+                    raw_scores,
+                    gt_local[:, :, :, 0:2],
+                    gt_mask,
+                )
+                for name, val in raw_metrics.items():
+                    self.log(
+                        f"val/pre_nms_{name}",
+                        (val * ttp_valid).sum() / valid_count,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=B,
+                    )
+
     # ── Optimizer / Scheduler ─────────────────────────────────────────────
 
     def configure_optimizers(self) -> dict[str, Any]:

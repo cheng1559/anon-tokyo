@@ -109,12 +109,14 @@ class AnonTokyoEncoder(nn.Module):
         use_rope: bool = True,
         use_drope: bool = True,
         position_encoding: str | None = None,
-        agent_in_channels: int = 10,
-        map_in_channels: int = 7,
+        agent_in_channels: int = 29,
+        map_in_channels: int = 9,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.sparse_k = sparse_k
+        self.agent_in_channels = agent_in_channels
+        self.map_in_channels = map_in_channels
 
         # PointNet for agent trajectories (+1 for mask channel)
         self.agent_encoder = PointNetPolylineEncoder(
@@ -148,6 +150,78 @@ class AnonTokyoEncoder(nn.Module):
             ]
         )
 
+    @staticmethod
+    def _augment_agent_features(batch: dict[str, Tensor]) -> Tensor:
+        obj_trajs = batch["obj_trajs"]
+        obj_mask = batch["obj_trajs_mask"].bool()
+        B, A, T, _ = obj_trajs.shape
+        dtype = obj_trajs.dtype
+        device = obj_trajs.device
+
+        pos_size = obj_trajs[..., 0:6]
+
+        obj_types = batch.get("obj_types")
+        if obj_types is None:
+            obj_types = torch.zeros(B, A, dtype=torch.long, device=device)
+        obj_types = obj_types.to(device=device)
+        type_onehot = obj_trajs.new_zeros(B, A, T, 5)
+        type_onehot[..., 0] = (obj_types == 1).to(dtype=dtype)[:, :, None]
+        type_onehot[..., 1] = (obj_types == 2).to(dtype=dtype)[:, :, None]
+        type_onehot[..., 2] = (obj_types == 3).to(dtype=dtype)[:, :, None]
+
+        ttp = batch.get("tracks_to_predict")
+        if ttp is not None:
+            ttp = ttp.to(device=device).long()
+            valid = (ttp >= 0) & (ttp < A)
+            if valid.any():
+                bi = torch.arange(B, device=device)[:, None].expand_as(ttp)
+                type_onehot[bi[valid], ttp.clamp(min=0)[valid], :, 3] = 1
+
+        sdc_idx = batch.get("sdc_track_index")
+        if sdc_idx is not None:
+            sdc_idx = sdc_idx.to(device=device).long()
+            if sdc_idx.ndim == 0:
+                sdc_idx = sdc_idx[None].expand(B)
+            valid_sdc = (sdc_idx >= 0) & (sdc_idx < A)
+            if valid_sdc.any():
+                bi = torch.arange(B, device=device)[valid_sdc]
+                type_onehot[bi, sdc_idx[valid_sdc], :, 4] = 1
+
+        time_embedding = obj_trajs.new_zeros(B, A, T, T + 1)
+        time_idx = torch.arange(T, device=device)
+        time_embedding[:, :, time_idx, time_idx] = 1
+        if "timestamps" in batch:
+            ts = batch["timestamps"].to(dtype=dtype, device=device)
+            if ts.ndim == 1:
+                ts = ts[None].expand(B, -1)
+            time_embedding[..., -1] = ts[:, None, :T]
+        else:
+            time_embedding[..., -1] = torch.linspace(0, 1, T, device=device, dtype=dtype)[None, None]
+
+        heading = obj_trajs[..., 6:8]
+        vel = obj_trajs[..., 8:10]
+        vel_pre = torch.roll(vel, shifts=1, dims=2)
+        acce = (vel - vel_pre) / 0.1
+        if T > 1:
+            acce[:, :, 0] = acce[:, :, 1]
+
+        out = torch.cat((pos_size, type_onehot, time_embedding, heading, vel, acce), dim=-1)
+        out = out.masked_fill(~obj_mask[..., None], 0)
+        return out
+
+    @staticmethod
+    def _augment_map_features(batch: dict[str, Tensor]) -> Tensor:
+        map_polys = batch["map_polylines"]
+        if map_polys.shape[-1] == 9:
+            return map_polys
+        xy = map_polys[..., 0:2]
+        pre_xy = torch.roll(xy, shifts=1, dims=2)
+        if xy.shape[2] > 1:
+            pre_xy[:, :, 0] = pre_xy[:, :, 1]
+        out = torch.cat((map_polys, pre_xy), dim=-1)
+        out = out.masked_fill(~batch["map_polylines_mask"].bool()[..., None], 0)
+        return out
+
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """
         Expected batch keys (scene-centric, from dataloader collation):
@@ -170,20 +244,24 @@ class AnonTokyoEncoder(nn.Module):
             obj_pos:      [B, A, 2]
             map_pos:      [B, M, 2]
         """
-        obj_trajs = batch["obj_trajs"]  # [B, A, T, 10]
         obj_mask_t = batch["obj_trajs_mask"]  # [B, A, T]
         agent_mask = batch["agent_mask"].bool()  # [B, A]
         agent_pos = batch["obj_positions"]  # [B, A, 2]
         agent_heading = batch["obj_headings"]  # [B, A]
 
-        map_polys = batch["map_polylines"]  # [B, M, P, 7]
         map_poly_mask = batch["map_polylines_mask"]  # [B, M, P]
         map_center = batch["map_polylines_center"]  # [B, M, 2]
         map_heading = batch["map_headings"]  # [B, M]
         map_mask = batch["map_mask"].bool()  # [B, M]
 
-        # Append mask channel to agent trajectories
-        agent_input = torch.cat([obj_trajs, obj_mask_t.unsqueeze(-1)], dim=-1)
+        obj_trajs = self._augment_agent_features(batch)
+        map_polys = self._augment_map_features(batch)
+        if obj_trajs.shape[-1] != self.agent_in_channels:
+            raise ValueError(f"Expected {self.agent_in_channels} agent features, got {obj_trajs.shape[-1]}")
+        if map_polys.shape[-1] != self.map_in_channels:
+            raise ValueError(f"Expected {self.map_in_channels} map features, got {map_polys.shape[-1]}")
+
+        agent_input = torch.cat([obj_trajs, obj_mask_t.unsqueeze(-1).to(dtype=obj_trajs.dtype)], dim=-1)
 
         # PointNet embedding
         agent_feat = self.agent_encoder(agent_input, obj_mask_t.bool())  # [B, A, D]

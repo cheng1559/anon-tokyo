@@ -161,3 +161,27 @@ class TestSceneCentricTransform:
         out = scene_centric_transform(_make_scenario(), max_agents=32, max_polylines=64)
         sdc = int(out["sdc_track_index"])
         np.testing.assert_allclose(out["obj_headings"][sdc], 0.0, atol=1e-5)
+
+    def test_map_selection_keeps_target_local_polylines(self) -> None:
+        """Map truncation should keep lanes near tracks_to_predict, not only near SDC."""
+        data = _make_scenario(num_agents=2, num_map_points=30)
+        data["tracks_to_predict"] = np.array([1], dtype=np.int32)
+        data["trajs"][:, :, 9] = 1.0
+        data["trajs"][0, :, 0:2] = 0.0
+        data["trajs"][0, :, 6] = 0.0
+        data["trajs"][1, :, 0] = 100.0
+        data["trajs"][1, :, 1] = 0.0
+        data["trajs"][1, :, 6] = 0.0
+
+        centers = [-2.0, 0.0, 2.0, 128.0, 130.0, 132.0]
+        segments = []
+        for cx in centers:
+            seg = np.zeros((5, 7), dtype=np.float32)
+            seg[:, 0] = cx + np.linspace(-0.2, 0.2, 5, dtype=np.float32)
+            seg[:, 3] = 1.0
+            segments.append(seg)
+        data["map_polylines"] = np.concatenate(segments, axis=0)
+
+        out = scene_centric_transform(data, max_agents=8, max_polylines=2)
+        valid_centers = out["map_polylines_center"][out["map_mask"] > 0]
+        assert np.any(valid_centers[:, 0] > 100.0)

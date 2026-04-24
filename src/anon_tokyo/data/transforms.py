@@ -73,6 +73,7 @@ def scene_centric_transform(
     max_polylines: int = 4096,
     num_points_per_polyline: int = 20,
     vector_break_dist: float = 1.0,
+    center_offset_of_map: tuple[float, float] = (30.0, 0.0),
     include_eval_meta: bool = False,
 ) -> dict[str, np.ndarray]:
     """Transform a raw scenario dict into scene-centric padded features."""
@@ -207,12 +208,23 @@ def scene_centric_transform(
     num_polys = len(polys)
 
     if num_polys > M:
-        # Keep closest to origin
+        # Keep map polylines close to the agents that will be decoded.  This
+        # preserves target-local lane context even when a target is far from
+        # the SDC origin, while still keeping an SDC-origin query for scene
+        # context and backwards-compatible behavior on simple cases.
         csum = (polys[:, :, 0:2] * poly_mask[:, :, None]).sum(axis=1)
         ccnt = np.clip(poly_mask.sum(axis=1, keepdims=True), 1, None)
         centers = csum / ccnt
-        dists = np.linalg.norm(centers, axis=1)
-        top_k = np.sort(np.argpartition(dists, M)[:M])
+        query_points = [np.zeros(2, dtype=np.float32)]
+        offset = np.asarray(center_offset_of_map, dtype=np.float32)
+        for track_idx in tracks_to_predict:
+            if track_idx < 0 or track_idx >= num_agents or not has_any[track_idx]:
+                continue
+            query_points.append(positions[track_idx] + rotate_2d(offset[None], headings[track_idx])[0])
+        queries = np.stack(query_points, axis=0)
+        dists = np.linalg.norm(centers[:, None, :] - queries[None, :, :], axis=-1).min(axis=1)
+        top_k = np.argpartition(dists, M)[:M]
+        top_k = top_k[np.argsort(dists[top_k])]
         polys, poly_mask = polys[top_k], poly_mask[top_k]
         num_polys = M
 
