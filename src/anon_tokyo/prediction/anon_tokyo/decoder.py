@@ -88,6 +88,7 @@ class AnonTokyoDecoder(MTRDecoder):
         obj_pos_feature_valid = self.obj_pos_encoding_layer(obj_pos_valid)
         pred_dense = self.dense_future_head(torch.cat((obj_pos_feature_valid, obj_feature_valid), dim=-1))
         pred_dense = pred_dense.view(pred_dense.shape[0], self.num_future_frames, 7)
+        pred_dense = torch.cat((pred_dense[:, :, 0:2] + obj_pos_valid[:, None, 0:2], pred_dense[:, :, 2:]), dim=-1)
         future_input = pred_dense[:, :, [0, 1, -2, -1]].flatten(1, 2)
         future_feature = self.future_traj_mlps(future_input)
         obj_feature_valid = self.traj_fusion_mlps(torch.cat((obj_feature_valid, future_feature), dim=-1))

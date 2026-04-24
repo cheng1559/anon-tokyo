@@ -115,7 +115,7 @@ def _dense_future_loss_query(
     """Dense future prediction loss for query-centric models.
 
     Same computation as ``_dense_future_loss`` but with ``[B, A, T, ...]``
-    layout instead of ``[K, A, T, ...]``.  Targets are agent-local futures.
+    layout instead of ``[K, A, T, ...]``.  Targets are query-frame futures.
     """
     B, A, T, _ = pred_dense.shape
     pred_gmm = pred_dense[:, :, :, 0:5]
@@ -295,7 +295,7 @@ def prediction_loss(
             pred_dense = pred_dense[:, 0]
         dense_loss = _dense_future_loss_query(
             pred_dense,
-            batch["obj_trajs_future_local"],
+            batch["obj_trajs_future"],
             batch["obj_trajs_future_mask"],
         )
         total_loss = total_loss + dense_loss
