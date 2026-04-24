@@ -1,4 +1,4 @@
-"""Unit tests for AnonTokyo scene-centric encoder."""
+"""Unit tests for AnonTokyo query-centric encoder."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from anon_tokyo.prediction.anon_tokyo.encoder import AnonTokyoEncoder, _EncoderL
 
 
 def _make_batch(B: int = 2, A: int = 16, M: int = 64, T: int = 11, P: int = 20) -> dict[str, torch.Tensor]:
-    """Create a synthetic batch matching scene-centric pipeline output."""
+    """Create a synthetic batch matching query-centric pipeline output."""
     return {
         "obj_trajs": torch.randn(B, A, T, 10),
         "obj_trajs_mask": torch.ones(B, A, T),

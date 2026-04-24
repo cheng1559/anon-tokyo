@@ -1,4 +1,4 @@
-"""Unit tests for AnonTokyo scene-centric decoder."""
+"""Unit tests for AnonTokyo query-centric decoder."""
 
 from __future__ import annotations
 

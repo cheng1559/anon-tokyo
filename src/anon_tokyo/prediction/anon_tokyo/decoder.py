@@ -1,6 +1,6 @@
-"""Scene-centric AnonTokyo decoder with MTR-style motion heads.
+"""Query-centric AnonTokyo decoder with MTR-style motion heads.
 
-The encoder sees one scene batch ``[B, A/M, D]``.  The motion decoder only
+The encoder sees one query-centric batch ``[B, A/M, D]``.  The motion decoder only
 creates intention queries for ``tracks_to_predict`` agents to avoid the
 ``128 agents * 64 queries`` OOM path, while still attending to the full scene.
 """
@@ -35,7 +35,7 @@ def _local_xy_to_scene(local_xy: Tensor, agent_pos: Tensor, agent_heading: Tenso
 
 
 class AnonTokyoDecoder(MTRDecoder):
-    """Target-agent scene decoder that reuses MTR-compatible decoder blocks."""
+    """Target-agent query-centric decoder that reuses MTR-compatible decoder blocks."""
 
     def _get_target_motion_query(self, obj_types: Tensor) -> tuple[Tensor, Tensor]:
         B, K = obj_types.shape

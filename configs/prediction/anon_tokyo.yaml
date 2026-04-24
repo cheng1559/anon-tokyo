@@ -1,4 +1,4 @@
-# AnonTokyo — Scene-Centric prediction with RoPE/DRoPE
+# AnonTokyo — Query-Centric prediction with RoPE/DRoPE
 seed_everything: 42
 
 trainer:

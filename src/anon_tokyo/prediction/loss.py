@@ -107,12 +107,12 @@ def velocity_loss(
     return (l1 * gt_mask).sum(dim=-1)  # [B, K]  (sum over T, matches MTR)
 
 
-def _dense_future_loss_scene(
+def _dense_future_loss_query(
     pred_dense: Tensor,
     gt_future: Tensor,
     gt_mask: Tensor,
 ) -> Tensor:
-    """Dense future prediction loss for scene-centric models.
+    """Dense future prediction loss for query-centric models.
 
     Same computation as ``_dense_future_loss`` but with ``[B, A, T, ...]``
     layout instead of ``[K, A, T, ...]``.  Targets are agent-local futures.
@@ -145,7 +145,7 @@ def _gather_tracks_if_all_agents(
     *,
     pred_is_target_agents: bool = False,
 ) -> Tensor:
-    """Gather ``tracks_to_predict`` when a scene-centric tensor is ``[B, A, ...]``."""
+    """Gather ``tracks_to_predict`` when a query-centric tensor is ``[B, A, ...]``."""
     if pred_is_target_agents:
         return tensor
     if "obj_types" not in batch:
@@ -293,7 +293,7 @@ def prediction_loss(
         pred_dense = output["pred_dense_trajs"]
         if pred_dense.ndim == 5:
             pred_dense = pred_dense[:, 0]
-        dense_loss = _dense_future_loss_scene(
+        dense_loss = _dense_future_loss_query(
             pred_dense,
             batch["obj_trajs_future_local"],
             batch["obj_trajs_future_mask"],

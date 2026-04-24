@@ -16,7 +16,7 @@ Last updated: 2026-04-24
 - `train_prediction.py` is the LightningCLI entry point.
 - Main prediction models:
   - `src/anon_tokyo/prediction/mtr`: agent-centric MTR baseline.
-  - `src/anon_tokyo/prediction/anon_tokyo`: scene-centric AnonTokyo model.
+  - `src/anon_tokyo/prediction/anon_tokyo`: query-centric AnonTokyo model.
 - Closed-loop simulation / PPO is still not implemented.
   - `train_sim.py` raises `NotImplementedError`.
   - `src/anon_tokyo/simulation` is still mostly placeholder files.
@@ -83,7 +83,7 @@ Last updated: 2026-04-24
 
 ## AnonTokyo
 
-- `AnonTokyoModel` is scene-centric at input time.
+- `AnonTokyoModel` is query-centric at input time.
 - It predicts only `tracks_to_predict` targets in the decoder to avoid decoding all 128 agents.
 - Regression targets remain agent-local, not scene-frame.
 - Decoder, loss style, NMS behavior, and training pipeline follow the MTR baseline.

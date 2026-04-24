@@ -1,4 +1,4 @@
-"""AnonTokyo: scene-centric prediction model (encoder + decoder).
+"""AnonTokyo: query-centric prediction model (encoder + decoder).
 
 No per-agent coordinate transform — the encoder uses RoPE/DRoPE
 for spatial and rotational encoding directly in the global frame.
@@ -14,7 +14,7 @@ from anon_tokyo.prediction.anon_tokyo.decoder import AnonTokyoDecoder
 
 
 class AnonTokyoModel(nn.Module):
-    """Full AnonTokyo scene-centric prediction model."""
+    """Full AnonTokyo query-centric prediction model."""
 
     def __init__(
         self,
@@ -77,7 +77,7 @@ class AnonTokyoModel(nn.Module):
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """
-        Input: scene-centric batch ``[B, ...]`` from dataloader.
+        Input: query-centric batch ``[B, ...]`` from dataloader.
 
         Returns:
             ``pred_trajs``  ``[B, K, num_modes_or_queries, T, 7]``

@@ -14,8 +14,8 @@ from anon_tokyo.prediction.loss import mtr_prediction_loss, prediction_loss
 from anon_tokyo.prediction.metrics import compute_prediction_metrics
 
 
-def _gather_scene_tracks(tensor: Tensor, batch: dict[str, Tensor], output: dict[str, Tensor] | None = None) -> Tensor:
-    """Gather tracks_to_predict from an all-agent scene tensor when needed."""
+def _gather_query_tracks(tensor: Tensor, batch: dict[str, Tensor], output: dict[str, Tensor] | None = None) -> Tensor:
+    """Gather tracks_to_predict from an all-agent query-centric tensor when needed."""
     if output is not None and bool(output.get("pred_is_target_agents", False)):
         return tensor
     if "obj_types" not in batch or tensor.shape[1] != batch["obj_types"].shape[1]:
@@ -101,8 +101,8 @@ class PredictionModule(L.LightningModule):
                     )
         elif log_train_metrics:
             with torch.no_grad():
-                pred_trajs = _gather_scene_tracks(output["pred_trajs"], batch, output)
-                pred_scores = _gather_scene_tracks(output["pred_scores"], batch, output)
+                pred_trajs = _gather_query_tracks(output["pred_trajs"], batch, output)
+                pred_scores = _gather_query_tracks(output["pred_scores"], batch, output)
                 B = pred_trajs.shape[0]
                 K = pred_trajs.shape[1]
                 ttp = batch["tracks_to_predict"]
@@ -175,8 +175,8 @@ class PredictionModule(L.LightningModule):
                 batch_size=batch["obj_trajs"].shape[0],
             )
 
-            pred_trajs = _gather_scene_tracks(output["pred_trajs"], batch, output)
-            pred_scores = _gather_scene_tracks(output["pred_scores"], batch, output)
+            pred_trajs = _gather_query_tracks(output["pred_trajs"], batch, output)
+            pred_scores = _gather_query_tracks(output["pred_scores"], batch, output)
             B = pred_trajs.shape[0]
             K = pred_trajs.shape[1]
             ttp = batch["tracks_to_predict"]
@@ -207,8 +207,8 @@ class PredictionModule(L.LightningModule):
 
             if "pred_list" in output:
                 raw_scores, raw_trajs = output["pred_list"][-1]
-                raw_trajs = _gather_scene_tracks(raw_trajs, batch, output)
-                raw_scores = _gather_scene_tracks(raw_scores, batch, output)
+                raw_trajs = _gather_query_tracks(raw_trajs, batch, output)
+                raw_scores = _gather_query_tracks(raw_scores, batch, output)
                 raw_metrics = compute_prediction_metrics(
                     raw_trajs[:, :, :, :, 0:2],
                     raw_scores,
