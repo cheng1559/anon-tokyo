@@ -110,7 +110,15 @@ class TestAnonTokyoEncoder:
     def test_output_keys(self, encoder: AnonTokyoEncoder):
         batch = _make_batch(B=2, A=8, M=32)
         out = encoder(batch)
-        assert set(out.keys()) == {"obj_feature", "map_feature", "obj_mask", "map_mask", "obj_pos", "map_pos"}
+        assert set(out.keys()) == {
+            "obj_feature",
+            "map_feature",
+            "obj_mask",
+            "map_mask",
+            "obj_pos",
+            "map_pos",
+            "obj_headings",
+        }
 
     def test_output_shapes(self, encoder: AnonTokyoEncoder):
         B, A, M = 2, 8, 32

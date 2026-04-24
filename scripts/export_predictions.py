@@ -168,12 +168,12 @@ def _process_scene_centric(
     device: str,
 ) -> list[dict]:
     """Collect predictions from scene-centric model output."""
-    pred_trajs = output["pred_trajs"]  # [B, K, M, T, 7]
-    pred_scores = torch.softmax(output["pred_scores"], dim=-1)  # [B, K, M]
-    pred_xy = pred_trajs[:, :, :, :, 0:2]
+    pred_trajs_all = output["pred_trajs"]  # [B, A, M, T, 7] or legacy [B, K, M, T, 7]
+    pred_scores_all = output["pred_scores"]  # eval-mode scores are already softmaxed/NMSed
 
     ttp = batch["tracks_to_predict"]  # [B, K_max]
-    B, K = pred_trajs.shape[0], pred_trajs.shape[1]
+    B = pred_trajs_all.shape[0]
+    K = ttp.shape[1]
     center_xy = batch["center_xy"]
     center_heading = batch["center_heading"]
     results: list[dict] = []
@@ -193,14 +193,17 @@ def _process_scene_centric(
             c_xy = center_xy[b].to(device)
             c_head = center_heading[b].to(device)
 
-            world_xy = _rotate_to_world(pred_xy[b, ki], a_head, a_pos, c_head, c_xy)
+            pred_agent_idx = ki if bool(output.get("pred_is_target_agents", False)) else ti
+            pred_xy = pred_trajs_all[b, pred_agent_idx, :, :, 0:2]
+            pred_scores = pred_scores_all[b, pred_agent_idx]
+            world_xy = _rotate_to_world(pred_xy, a_head, a_pos, c_head, c_xy)
 
             raw_idx = int(raw_ttp[ki])
             results.append(
                 {
                     "scenario_id": scenario_id,
                     "pred_trajs": world_xy.cpu().numpy(),
-                    "pred_scores": pred_scores[b, ki].cpu().numpy(),
+                    "pred_scores": pred_scores.cpu().numpy(),
                     "object_id": int(raw["object_id"][raw_idx]),
                     "object_type": INT_TO_WOMD_TYPE.get(int(raw["object_type"][raw_idx]), "TYPE_UNSET"),
                     "gt_trajs": raw["trajs"][raw_idx],
@@ -256,7 +259,7 @@ def main() -> None:
         with torch.no_grad():
             output = lit_module.model(batch_dev)
 
-        is_ac = "pred_list" in output
+        is_ac = "batch_idx" in output or "input_dict" in output
         fn = _process_agent_centric if is_ac else _process_scene_centric
         all_preds.extend(fn(output, batch, npz_root, args.device))
 

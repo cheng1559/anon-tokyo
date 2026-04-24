@@ -14,6 +14,17 @@ from anon_tokyo.prediction.loss import mtr_prediction_loss, prediction_loss
 from anon_tokyo.prediction.metrics import compute_prediction_metrics
 
 
+def _gather_scene_tracks(tensor: Tensor, batch: dict[str, Tensor], output: dict[str, Tensor] | None = None) -> Tensor:
+    """Gather tracks_to_predict from an all-agent scene tensor when needed."""
+    if output is not None and bool(output.get("pred_is_target_agents", False)):
+        return tensor
+    if "obj_types" not in batch or tensor.shape[1] != batch["obj_types"].shape[1]:
+        return tensor
+    ttp = batch["tracks_to_predict"]
+    b_idx = torch.arange(tensor.shape[0], device=tensor.device)[:, None].expand(tensor.shape[0], ttp.shape[1])
+    return tensor[b_idx, ttp.clamp(min=0)]
+
+
 class PredictionModule(L.LightningModule):
     """Lightning wrapper for open-loop trajectory prediction training."""
 
@@ -90,17 +101,19 @@ class PredictionModule(L.LightningModule):
                     )
         elif log_train_metrics:
             with torch.no_grad():
-                B = output["pred_trajs"].shape[0]
-                K = output["pred_trajs"].shape[1]
+                pred_trajs = _gather_scene_tracks(output["pred_trajs"], batch, output)
+                pred_scores = _gather_scene_tracks(output["pred_scores"], batch, output)
+                B = pred_trajs.shape[0]
+                K = pred_trajs.shape[1]
                 ttp = batch["tracks_to_predict"]
                 ttp_clamped = ttp.clamp(min=0)
                 b_idx = torch.arange(B, device=ttp.device)[:, None].expand(B, K)
                 gt_local = batch["obj_trajs_future_local"][b_idx, ttp_clamped[:, :K]]
                 gt_mask = batch["obj_trajs_future_mask"][b_idx, ttp_clamped[:, :K]]
-                pred_xy = output["pred_trajs"][:, :, :, :, 0:2]
+                pred_xy = pred_trajs[:, :, :, :, 0:2]
                 metrics = compute_prediction_metrics(
                     pred_xy,
-                    output["pred_scores"],
+                    pred_scores,
                     gt_local[:, :, :, 0:2],
                     gt_mask,
                 )
@@ -162,8 +175,10 @@ class PredictionModule(L.LightningModule):
                 batch_size=batch["obj_trajs"].shape[0],
             )
 
-            B = output["pred_trajs"].shape[0]
-            K = output["pred_trajs"].shape[1]
+            pred_trajs = _gather_scene_tracks(output["pred_trajs"], batch, output)
+            pred_scores = _gather_scene_tracks(output["pred_scores"], batch, output)
+            B = pred_trajs.shape[0]
+            K = pred_trajs.shape[1]
             ttp = batch["tracks_to_predict"]
             ttp_clamped = ttp.clamp(min=0)
 
@@ -171,10 +186,10 @@ class PredictionModule(L.LightningModule):
             gt_local = batch["obj_trajs_future_local"][b_idx, ttp_clamped[:, :K]]
             gt_mask = batch["obj_trajs_future_mask"][b_idx, ttp_clamped[:, :K]]
 
-            pred_xy = output["pred_trajs"][:, :, :, :, 0:2]
+            pred_xy = pred_trajs[:, :, :, :, 0:2]
             metrics = compute_prediction_metrics(
                 pred_xy,
-                output["pred_scores"],
+                pred_scores,
                 gt_local[:, :, :, 0:2],
                 gt_mask,
             )

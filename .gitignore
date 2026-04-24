@@ -14,7 +14,7 @@ uv.lock
 data/raw
 data/processed
 data/shards
-data/intention_points.pkl
+*.pkl
 
 # Training outputs
 outputs/
@@ -31,7 +31,7 @@ checkpoints/
 .DS_Store
 Thumbs.db
 
-# Reference code
+# References
 reference-code
 assets/paper
-*.pkl
+assets/refs

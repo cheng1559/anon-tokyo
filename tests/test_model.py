@@ -77,16 +77,16 @@ class TestAnonTokyoModel:
         assert "pred_scores" in out
 
     def test_output_shapes_eval(self, model: AnonTokyoModel):
-        B, K = 2, 4
-        batch = _make_batch(B=B, A=8, M=16, K=K, T=11, P=10)
+        B, A, K = 2, 8, 4
+        batch = _make_batch(B=B, A=A, M=16, K=K, T=11, P=10)
         model.eval()
         out = model(batch)
         assert out["pred_trajs"].shape == (B, K, 6, 20, 7)
         assert out["pred_scores"].shape == (B, K, 6)
 
     def test_output_shapes_train(self, model: AnonTokyoModel):
-        B, K = 2, 4
-        batch = _make_batch(B=B, A=8, M=16, K=K, T=11, P=10)
+        B, A, K = 2, 8, 4
+        batch = _make_batch(B=B, A=A, M=16, K=K, T=11, P=10)
         model.train()
         out = model(batch)
         assert out["pred_trajs"].shape == (B, K, 64, 20, 7)

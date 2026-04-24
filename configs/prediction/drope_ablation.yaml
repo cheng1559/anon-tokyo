@@ -1,56 +1,73 @@
-# DRoPE ablation — Sinusoidal PE baseline (no RoPE, no DRoPE)
+# AnonTokyo sinusoidal-position baseline
 seed_everything: 42
 
 trainer:
   max_epochs: 30
   precision: bf16-mixed
   strategy: ddp
-  devices: 8
+  devices: auto
+  num_nodes: 1
   logger:
     class_path: lightning.pytorch.loggers.TensorBoardLogger
     init_args:
       save_dir: tb_logs
-      name: prediction_sinusoidal_baseline
+      name: prediction_anon_tokyo_sine
+  gradient_clip_val: 1000.0
+  log_every_n_steps: 10
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
         monitor: val/mAP
         mode: max
         save_top_k: 3
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        every_n_train_steps: 1000
+        save_top_k: -1
+        save_last: true
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
 
 model:
-  class_path: anon_tokyo.prediction.lit_module.PredictionModule
-  init_args:
-    model_class: anon_tokyo.prediction.anon_tokyo.model.AnonTokyoModel
-    model_kwargs:
+  model:
+    class_path: anon_tokyo.prediction.anon_tokyo.model.AnonTokyoModel
+    init_args:
       d_model: 256
       num_encoder_layers: 6
       num_decoder_layers: 6
       d_decoder: 512
+      map_d_model: 256
       num_heads: 8
-      sparse_k: 32
+      sparse_k: 16
+      use_local_attn: true
+      num_attn_neighbors: 16
       num_modes: 6
       num_intention_queries: 64
       num_future_frames: 80
-      use_rope: false
-      use_drope: false
-    optimizer_class: torch.optim.AdamW
-    optimizer_kwargs:
-      lr: 1.0e-4
-      weight_decay: 0.01
-    loss_weights:
-      reg: 1.0
-      score: 1.0
-      vel: 0.2
+      position_encoding: sine
+      intention_points_file: reference-code/mtr/data/waymo/cluster_64_center_dict.pkl
+      center_offset_of_map: [30.0, 0.0]
+      num_base_map_polylines: 256
+      num_waypoint_map_polylines: 128
+  optimizer_class: torch.optim.AdamW
+  optimizer_kwargs:
+    lr: 1.0e-4
+    weight_decay: 0.01
+  scheduler_kwargs:
+    decay_step_list: [22, 24, 26, 28]
+    lr_decay: 0.5
+    lr_clip: 1.0e-6
+  loss_weights:
+    reg: 1.0
+    score: 1.0
+    vel: 0.5
+  compile_model: false
+  train_metrics_interval: 100
 
 data:
-  class_path: anon_tokyo.data.datamodule.WOMDDataModule
-  init_args:
-    data_root: data/shards
-    batch_size: 16
-    num_workers: 8
-    max_agents: 128
-    max_polylines: 4096
-    use_npz: true
-    npz_root: data/processed
+  data_root: data/shards
+  batch_size: 10
+  num_workers: 8
+  max_agents: 128
+  max_polylines: 768
+  use_npz: true
+  npz_root: data/processed

@@ -81,7 +81,7 @@ class TestAnonTokyoDecoder:
         batch = _make_batch(B=B, A=A, K=K)
         decoder.eval()
         out = decoder(enc_out, batch)
-        # In eval mode, NMS reduces to num_motion_modes
+        # In eval mode, NMS reduces to num_motion_modes for target agents only.
         assert out["pred_trajs"].shape == (B, K, 6, 20, 7)
         assert out["pred_scores"].shape == (B, K, 6)
 
@@ -91,7 +91,7 @@ class TestAnonTokyoDecoder:
         batch = _make_batch(B=B, A=A, K=K)
         decoder.train()
         out = decoder(enc_out, batch)
-        # In train mode, all Q=64 queries returned
+        # In train mode, all Q=64 queries returned for target agents only.
         assert out["pred_trajs"].shape == (B, K, 64, 20, 7)
         assert out["pred_scores"].shape == (B, K, 64)
 
@@ -124,7 +124,6 @@ class TestAnonTokyoDecoder:
         batch = {"tracks_to_predict": ttp, "obj_types": torch.ones(B, A, dtype=torch.long)}
         decoder.eval()
         out = decoder(enc_out, batch)
-        # Still produces K=4 outputs (padded tracks use agent 0 due to clamp)
         assert out["pred_trajs"].shape == (B, K, 6, 20, 7)
 
     def test_deterministic_eval(self, decoder: AnonTokyoDecoder):

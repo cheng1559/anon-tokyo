@@ -260,7 +260,7 @@ class MultiheadAttentionLocal(nn.Module):
             gathered_k = k[safe_pair]
             gathered_v = v[safe_pair]
 
-        weights = (q[:, None] * gathered_k).sum(dim=-1)
+        weights = torch.einsum("qhd,qkhd->qkh", q, gathered_k)
         weights = weights.masked_fill(invalid[..., None], float("-inf"))
         if all_invalid.any():
             weights[all_invalid] = 0.0
@@ -268,6 +268,6 @@ class MultiheadAttentionLocal(nn.Module):
         weights = F.dropout(weights, p=self.dropout, training=self.training)
         weights = weights.masked_fill(invalid[..., None], 0.0)
 
-        out = (weights[..., None] * gathered_v).sum(dim=1).reshape(total_query_len, vdim)
+        out = torch.einsum("qkh,qkhd->qhd", weights, gathered_v).reshape(total_query_len, vdim)
         out = self.out_proj(out)
         return out, weights.sum(dim=-1) / self.num_heads

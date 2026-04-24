@@ -59,6 +59,7 @@ model:
     score: 1.0
     vel: 0.5
   compile_model: false
+  train_metrics_interval: 100
 
 data:
   data_root: data/shards

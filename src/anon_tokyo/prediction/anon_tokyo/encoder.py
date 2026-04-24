@@ -27,10 +27,11 @@ class _EncoderLayer(nn.Module):
         dropout: float,
         use_rope: bool,
         use_drope: bool,
+        position_encoding: str | None = None,
     ) -> None:
         super().__init__()
         # Map-Map self-attention
-        self.mm_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope)
+        self.mm_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope, position_encoding)
         self.mm_norm = nn.LayerNorm(d_model)
         self.mm_ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model * 4, d_model)
@@ -40,7 +41,7 @@ class _EncoderLayer(nn.Module):
         self.mm_ffn_drop = nn.Dropout(dropout)
 
         # Agent-Agent self-attention
-        self.aa_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope)
+        self.aa_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope, position_encoding)
         self.aa_norm = nn.LayerNorm(d_model)
         self.aa_ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model * 4, d_model)
@@ -50,7 +51,7 @@ class _EncoderLayer(nn.Module):
         self.aa_ffn_drop = nn.Dropout(dropout)
 
         # Agent-Map cross-attention
-        self.am_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope)
+        self.am_attn = SparseTopKAttention(d_model, num_heads, sparse_k, dropout, use_rope, use_drope, position_encoding)
         self.am_norm = nn.LayerNorm(d_model)
         self.am_ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model * 4, d_model)
@@ -107,6 +108,7 @@ class AnonTokyoEncoder(nn.Module):
         dropout: float = 0.1,
         use_rope: bool = True,
         use_drope: bool = True,
+        position_encoding: str | None = None,
         agent_in_channels: int = 10,
         map_in_channels: int = 7,
     ) -> None:
@@ -132,7 +134,18 @@ class AnonTokyoEncoder(nn.Module):
         )
 
         self.layers = nn.ModuleList(
-            [_EncoderLayer(d_model, num_heads, sparse_k, dropout, use_rope, use_drope) for _ in range(num_layers)]
+            [
+                _EncoderLayer(
+                    d_model,
+                    num_heads,
+                    sparse_k,
+                    dropout,
+                    use_rope,
+                    use_drope,
+                    position_encoding,
+                )
+                for _ in range(num_layers)
+            ]
         )
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -203,4 +216,5 @@ class AnonTokyoEncoder(nn.Module):
             "map_mask": map_mask,
             "obj_pos": agent_pos,
             "map_pos": map_center,
+            "obj_headings": agent_heading,
         }

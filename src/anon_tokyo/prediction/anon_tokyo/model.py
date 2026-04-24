@@ -25,18 +25,28 @@ class AnonTokyoModel(nn.Module):
         map_d_model: int | None = None,
         num_heads: int = 8,
         sparse_k: int = 32,
+        use_local_attn: bool = True,
+        num_attn_neighbors: int | None = None,
         num_modes: int = 6,
         num_intention_queries: int = 64,
         num_future_frames: int = 80,
         dropout: float = 0.1,
         use_rope: bool = True,
         use_drope: bool = True,
+        position_encoding: str | None = None,
         intention_points_file: str = "data/intention_points.pkl",
         nms_dist_thresh: float = 2.5,
+        center_offset_of_map: tuple[float, float] = (30.0, 0.0),
+        num_base_map_polylines: int = 256,
+        num_waypoint_map_polylines: int = 128,
     ) -> None:
         super().__init__()
         if map_d_model is None:
             map_d_model = d_model
+        if num_attn_neighbors is not None:
+            sparse_k = num_attn_neighbors
+        if not use_local_attn:
+            raise ValueError("AnonTokyo encoder/decoder currently requires sparse local attention.")
 
         self.encoder = AnonTokyoEncoder(
             d_model=d_model,
@@ -46,6 +56,7 @@ class AnonTokyoModel(nn.Module):
             dropout=dropout,
             use_rope=use_rope,
             use_drope=use_drope,
+            position_encoding=position_encoding,
         )
         self.decoder = AnonTokyoDecoder(
             in_channels=d_model,
@@ -59,6 +70,9 @@ class AnonTokyoModel(nn.Module):
             num_intention_queries=num_intention_queries,
             intention_points_file=intention_points_file,
             nms_dist_thresh=nms_dist_thresh,
+            center_offset_of_map=center_offset_of_map,
+            num_base_map_polylines=num_base_map_polylines,
+            num_waypoint_map_polylines=num_waypoint_map_polylines,
         )
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -66,8 +80,8 @@ class AnonTokyoModel(nn.Module):
         Input: scene-centric batch ``[B, ...]`` from dataloader.
 
         Returns:
-            ``pred_trajs``  ``[B, K, num_modes, T, 7]``
-            ``pred_scores`` ``[B, K, num_modes]``
+            ``pred_trajs``  ``[B, K, num_modes_or_queries, T, 7]``
+            ``pred_scores`` ``[B, K, num_modes_or_queries]``
         """
         enc_out = self.encoder(batch)
         dec_out = self.decoder(enc_out, batch)

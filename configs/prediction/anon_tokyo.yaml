@@ -35,27 +35,33 @@ model:
       num_encoder_layers: 6
       num_decoder_layers: 6
       d_decoder: 512
+      map_d_model: 256
       num_heads: 8
-      sparse_k: 32
+      sparse_k: 16
       num_modes: 6
       num_intention_queries: 64
       num_future_frames: 80
-      use_rope: true
-      use_drope: true
-      intention_points_file: data/intention_points.pkl
+      position_encoding: rope_drope
+      intention_points_file: reference-code/mtr/data/waymo/cluster_64_center_dict.pkl
+      use_local_attn: true
+      num_attn_neighbors: 16
+      center_offset_of_map: [30.0, 0.0]
+      num_base_map_polylines: 256
+      num_waypoint_map_polylines: 128
   optimizer_class: torch.optim.AdamW
   optimizer_kwargs:
     lr: 1.0e-4
     weight_decay: 0.01
   scheduler_kwargs:
-    warmup_ratio: 0.1
-    start_factor: 0.1
-    eta_min: 1.0e-6
+    decay_step_list: [22, 24, 26, 28]
+    lr_decay: 0.5
+    lr_clip: 1.0e-6
   loss_weights:
     reg: 1.0
     score: 1.0
-    vel: 0.2
+    vel: 0.5
   compile_model: false
+  train_metrics_interval: 100
 
 data:
   data_root: data/shards

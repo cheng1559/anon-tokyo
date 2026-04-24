@@ -1,156 +1,258 @@
-"""AnonTokyo: scene-centric decoder wrapping MTR's intention-query decoder.
+"""Scene-centric AnonTokyo decoder with MTR-style motion heads.
 
-Converts scene-centric encoder output ``[B, A, D]`` to agent-centric
-format ``[B*K, ...]`` expected by the MTR decoder, runs the decoder,
-and reshapes output back to ``[B, K, ...]``.
-
-The core decoder architecture is identical to MTR for fair ablation.
+The encoder sees one scene batch ``[B, A/M, D]``.  The motion decoder only
+creates intention queries for ``tracks_to_predict`` agents to avoid the
+``128 agents * 64 queries`` OOM path, while still attending to the full scene.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from anon_tokyo.prediction.mtr.decoder import MTRDecoder
 
 
-class AnonTokyoDecoder(nn.Module):
-    """Scene-centric → MTR decoder → scene-centric output adapter.
+def _local_xy_to_scene(local_xy: Tensor, agent_pos: Tensor, agent_heading: Tensor) -> Tensor:
+    """Transform agent-local xy to the scene frame.
 
-    Handles the gathering of tracked-agent features and expansion of
-    scene-level context so the MTR decoder can run in its native format.
+    Args:
+        local_xy: ``[B, A, ..., 2]``.
+        agent_pos: ``[B, A, 2]`` scene-frame current positions.
+        agent_heading: ``[B, A]`` scene-frame headings.
     """
+    extra_dims = local_xy.ndim - agent_heading.ndim - 1
+    view_shape = (*agent_heading.shape, *([1] * extra_dims))
+    c = agent_heading.cos().view(view_shape)
+    s = agent_heading.sin().view(view_shape)
+    pos = agent_pos.view(*agent_pos.shape[:2], *([1] * extra_dims), 2)
+    x = local_xy[..., 0]
+    y = local_xy[..., 1]
+    scene_x = x * c - y * s + pos[..., 0]
+    scene_y = x * s + y * c + pos[..., 1]
+    return torch.stack((scene_x, scene_y), dim=-1)
 
-    def __init__(
+
+class AnonTokyoDecoder(MTRDecoder):
+    """Target-agent scene decoder that reuses MTR-compatible decoder blocks."""
+
+    def _get_target_motion_query(self, obj_types: Tensor) -> tuple[Tensor, Tensor]:
+        B, K = obj_types.shape
+        query_embed, intention_points = self.get_motion_query(obj_types.reshape(-1))
+        query_embed = query_embed.permute(1, 0, 2).contiguous().view(B, K, self.num_queries, self.d_model)
+        query_embed = query_embed.reshape(B, K * self.num_queries, self.d_model).permute(1, 0, 2).contiguous()
+        intention_points = intention_points.permute(1, 0, 2).contiguous().view(B, K, self.num_queries, 2)
+        return query_embed, intention_points
+
+    def _collect_map_idxs_scene(
         self,
-        in_channels: int = 256,
-        d_model: int = 512,
-        map_d_model: int = 256,
-        num_layers: int = 6,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-        num_future_frames: int = 80,
-        num_motion_modes: int = 6,
-        num_intention_queries: int = 64,
-        intention_points_file: str = "data/intention_points.pkl",
-        nms_dist_thresh: float = 2.5,
-    ) -> None:
-        super().__init__()
-        self.mtr_decoder = MTRDecoder(
-            in_channels=in_channels,
-            d_model=d_model,
-            map_d_model=map_d_model,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-            num_future_frames=num_future_frames,
-            num_motion_modes=num_motion_modes,
-            num_intention_queries=num_intention_queries,
-            intention_points_file=intention_points_file,
-            nms_dist_thresh=nms_dist_thresh,
-            keep_query_pos_all=True,
-        )
+        map_pos: Tensor,
+        map_mask: Tensor,
+        pred_waypoints_scene: Tensor,
+        base_points_scene: Tensor,
+    ) -> Tensor:
+        """Collect base and dynamic map polylines per query in scene frame."""
+        B, num_query, _ = base_points_scene.shape
+        num_polylines = map_pos.shape[1]
+        masked_map_pos = map_pos.masked_fill(~map_mask[..., None], 10000000.0)
 
-    def forward(
+        base_dist = (base_points_scene[:, :, None, :] - masked_map_pos[:, None, :, 0:2]).norm(dim=-1)
+        base_k = min(num_polylines, self.num_base_map_polylines)
+        base_topk_dist, base_idxs = base_dist.topk(k=base_k, dim=-1, largest=False)
+        base_idxs[base_topk_dist > 10000000] = -1
+        if base_k < self.num_base_map_polylines:
+            base_idxs = F.pad(base_idxs, (0, self.num_base_map_polylines - base_k), value=-1)
+
+        dynamic_dist = (
+            pred_waypoints_scene[:, :, None, :, 0:2] - masked_map_pos[:, None, :, None, 0:2]
+        ).norm(dim=-1).min(dim=-1).values
+        dyn_k = min(num_polylines, self.num_waypoint_map_polylines)
+        dynamic_topk_dist, dynamic_idxs = dynamic_dist.topk(k=dyn_k, dim=-1, largest=False)
+        dynamic_idxs[dynamic_topk_dist > 10000000] = -1
+        if dyn_k < self.num_waypoint_map_polylines:
+            dynamic_idxs = F.pad(dynamic_idxs, (0, self.num_waypoint_map_polylines - dyn_k), value=-1)
+
+        collected = torch.cat((base_idxs, dynamic_idxs), dim=-1)
+        sorted_idxs = collected.sort(dim=-1).values
+        unique_mask = torch.ones_like(sorted_idxs, dtype=torch.bool)
+        unique_mask[..., 1:] = sorted_idxs[..., 1:] != sorted_idxs[..., :-1]
+        sorted_idxs = sorted_idxs.masked_fill(~unique_mask, -1)
+        return sorted_idxs.int()
+
+    def apply_dense_future_prediction(self, obj_feature: Tensor, obj_mask: Tensor, obj_pos: Tensor) -> tuple[Tensor, Tensor]:
+        B, A, _ = obj_feature.shape
+        valid = obj_mask.bool()
+        obj_pos_valid = obj_pos[valid][..., 0:2]
+        obj_feature_valid = obj_feature[valid]
+        obj_pos_feature_valid = self.obj_pos_encoding_layer(obj_pos_valid)
+        pred_dense = self.dense_future_head(torch.cat((obj_pos_feature_valid, obj_feature_valid), dim=-1))
+        pred_dense = pred_dense.view(pred_dense.shape[0], self.num_future_frames, 7)
+        future_input = pred_dense[:, :, [0, 1, -2, -1]].flatten(1, 2)
+        future_feature = self.future_traj_mlps(future_input)
+        obj_feature_valid = self.traj_fusion_mlps(torch.cat((obj_feature_valid, future_feature), dim=-1))
+
+        ret_feature = torch.zeros_like(obj_feature)
+        ret_feature[valid] = obj_feature_valid.to(dtype=ret_feature.dtype)
+        ret_dense = obj_feature.new_zeros(B, A, self.num_future_frames, 7)
+        ret_dense[valid] = pred_dense.to(dtype=ret_dense.dtype)
+        self.forward_ret_dict["pred_dense_trajs"] = ret_dense
+        return ret_feature, ret_dense
+
+    def apply_transformer_decoder(
         self,
-        enc_out: dict[str, Tensor],
-        batch: dict[str, Tensor],
-    ) -> dict[str, Tensor]:
-        """
-        Args:
-            enc_out: Scene-centric encoder output:
-                ``obj_feature``  [B, A, D_enc]
-                ``map_feature``  [B, M, D_enc]
-                ``obj_mask``     [B, A]  bool
-                ``map_mask``     [B, M]  bool
-                ``obj_pos``      [B, A, 2]
-                ``map_pos``      [B, M, 2]
-            batch: Collated batch with:
-                ``tracks_to_predict``  [B, K_max]  int, -1 padded
-                ``obj_types``          [B, A]      int
+        center_objects_feature: Tensor,
+        center_objects_type: Tensor,
+        center_objects_pos: Tensor,
+        center_objects_heading: Tensor,
+        obj_feature: Tensor,
+        obj_mask: Tensor,
+        obj_pos: Tensor,
+        map_feature: Tensor,
+        map_mask: Tensor,
+        map_pos: Tensor,
+    ) -> list[list[Tensor]]:
+        B, K, _ = center_objects_feature.shape
+        num_query_total = K * self.num_queries
 
-        Returns:
-            ``pred_trajs``:  [B, K, num_modes, T, 7]  or  [B, K, M_out, T, 7]
-            ``pred_scores``: [B, K, num_modes]         or  [B, K, M_out]
-        """
-        obj_feat = enc_out["obj_feature"]  # [B, A, D]
-        map_feat = enc_out["map_feature"]  # [B, M, D]
-        obj_mask = enc_out["obj_mask"]  # [B, A]
-        map_mask = enc_out["map_mask"]  # [B, M]
-        obj_pos = enc_out["obj_pos"]  # [B, A, 2]
-        map_pos = enc_out["map_pos"]  # [B, M, 2]
+        intention_query, intention_points_local = self._get_target_motion_query(center_objects_type)
+        query_content = torch.zeros_like(intention_query)
+        self.forward_ret_dict["intention_points"] = intention_points_local
 
-        B, A, D = obj_feat.shape
-        M = map_feat.shape[1]
-        device = obj_feat.device
+        center_feature = center_objects_feature[:, :, None, :].expand(B, K, self.num_queries, -1)
+        center_feature = center_feature.reshape(B, num_query_total, -1).permute(1, 0, 2).contiguous()
 
-        ttp = batch["tracks_to_predict"]  # [B, K_max]
+        intention_points_scene = _local_xy_to_scene(intention_points_local, center_objects_pos, center_objects_heading)
+        base_forward = torch.tensor(self.center_offset_of_map, device=obj_feature.device, dtype=obj_feature.dtype)
+        base_points_scene = _local_xy_to_scene(
+            base_forward.view(1, 1, 1, 2).expand(B, K, 1, 2),
+            center_objects_pos,
+            center_objects_heading,
+        ).squeeze(2)
+        base_points_scene = base_points_scene[:, :, None, :].expand(B, K, self.num_queries, 2).reshape(B, num_query_total, 2)
+
+        pred_waypoints_scene = intention_points_scene.reshape(B, num_query_total, 1, 2)
+        dynamic_query_center = intention_points_scene.reshape(B, num_query_total, 2).permute(1, 0, 2).contiguous()
+
+        pred_list: list[list[Tensor]] = []
+        for layer_idx in range(self.num_decoder_layers):
+            obj_query_feature = self.apply_cross_attention(
+                obj_feature,
+                obj_mask,
+                obj_pos,
+                query_content,
+                intention_query,
+                self.obj_decoder_layers[layer_idx],
+                dynamic_query_center,
+                layer_idx=layer_idx,
+            )
+            collected_idxs = self._collect_map_idxs_scene(
+                map_pos,
+                map_mask,
+                pred_waypoints_scene,
+                base_points_scene,
+            )
+            map_query_feature = self.apply_cross_attention(
+                map_feature,
+                map_mask,
+                map_pos,
+                query_content,
+                intention_query,
+                self.map_decoder_layers[layer_idx],
+                dynamic_query_center,
+                layer_idx=layer_idx,
+                use_local_attn=True,
+                query_index_pair=collected_idxs,
+                query_content_pre_mlp=self.map_query_content_mlps[layer_idx] if self.map_query_content_mlps is not None else None,
+                query_embed_pre_mlp=self.map_query_embed_mlps,
+            )
+            query_feature = torch.cat([center_feature, obj_query_feature, map_query_feature], dim=-1)
+            query_content = self.query_feature_fusion_layers[layer_idx](query_feature.flatten(0, 1)).view(
+                num_query_total, B, -1
+            )
+
+            query_content_t = query_content.permute(1, 0, 2).contiguous().view(B * K * self.num_queries, -1)
+            pred_scores = self.motion_cls_heads[layer_idx](query_content_t).view(B, K, self.num_queries)
+            pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(
+                B, K, self.num_queries, self.num_future_frames, 7
+            )
+            pred_list.append([pred_scores, pred_trajs])
+
+            pred_waypoints_scene = _local_xy_to_scene(
+                pred_trajs[..., 0:2].flatten(2, 3),
+                center_objects_pos,
+                center_objects_heading,
+            ).view(B, K * self.num_queries, self.num_future_frames, 2)
+            dynamic_query_center = pred_waypoints_scene[:, :, -1].permute(1, 0, 2).contiguous()
+
+        return pred_list
+
+    def generate_final_prediction(self, pred_list: list[list[Tensor]]) -> tuple[Tensor, Tensor]:
+        pred_scores, pred_trajs = pred_list[-1]
+        B, K, Q, T, C = pred_trajs.shape
+        pred_scores = torch.softmax(pred_scores, dim=-1)
+        if self.num_motion_modes != Q:
+            pred_trajs_flat, pred_scores_flat, _ = self.batch_nms(
+                pred_trajs.reshape(B * K, Q, T, C),
+                pred_scores.reshape(B * K, Q),
+            )
+            pred_trajs = pred_trajs_flat.view(B, K, self.num_motion_modes, T, C)
+            pred_scores = pred_scores_flat.view(B, K, self.num_motion_modes)
+        return pred_scores, pred_trajs
+
+    def forward(self, enc_out: dict[str, Tensor], batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        self.forward_ret_dict = {}
+
+        obj_feature = enc_out["obj_feature"]
+        obj_mask = enc_out["obj_mask"].bool()
+        obj_pos = enc_out["obj_pos"]
+        obj_heading = enc_out.get("obj_headings", batch.get("obj_headings"))
+        if obj_heading is None:
+            obj_heading = obj_pos.new_zeros(obj_pos.shape[:2])
+        map_feature = enc_out["map_feature"]
+        map_mask = enc_out["map_mask"].bool()
+        map_pos = enc_out["map_pos"]
+
+        B, A, _ = obj_feature.shape
+        num_polylines = map_feature.shape[1]
+
+        center_feature = self.in_proj_center_obj(obj_feature.flatten(0, 1)).view(B, A, -1)
+        obj_proj = self.in_proj_obj(obj_feature.flatten(0, 1)).view(B, A, -1)
+        obj_proj = obj_proj * obj_mask.unsqueeze(-1).type_as(obj_proj)
+        map_proj = self.in_proj_map(map_feature.flatten(0, 1)).view(B, num_polylines, -1)
+        map_proj = map_proj * map_mask.unsqueeze(-1).type_as(map_proj)
+
+        obj_proj, pred_dense = self.apply_dense_future_prediction(obj_proj, obj_mask, obj_pos)
+
+        ttp = batch["tracks_to_predict"].long()
         K = ttp.shape[1]
         ttp_clamped = ttp.clamp(min=0)
+        b_idx = torch.arange(B, device=obj_feature.device)[:, None].expand(B, K)
+        center_feature = center_feature[b_idx, ttp_clamped]
+        center_pos = obj_pos[b_idx, ttp_clamped]
+        center_heading = obj_heading[b_idx, ttp_clamped]
+        center_type = batch["obj_types"].long()[b_idx, ttp_clamped]
 
-        # Gather center object features: [B, K, D]
-        b_idx = torch.arange(B, device=device)[:, None].expand(B, K)
-        center_feat = obj_feat[b_idx, ttp_clamped]  # [B, K, D]
-
-        # Gather center object types: [B, K]
-        center_obj_type = batch["obj_types"][b_idx, ttp_clamped]  # [B, K]
-
-        # Expand scene-level features per tracked agent → [B*K, ...]
-        # Each tracked agent in the same scene shares the same context
-        obj_feat_exp = obj_feat[:, None, :, :].expand(B, K, A, D).reshape(B * K, A, D)
-        map_feat_exp = map_feat[:, None, :, :].expand(B, K, M, map_feat.shape[-1]).reshape(B * K, M, map_feat.shape[-1])
-        obj_mask_exp = obj_mask[:, None, :].expand(B, K, A).reshape(B * K, A)
-        map_mask_exp = map_mask[:, None, :].expand(B, K, M).reshape(B * K, M)
-        obj_pos_exp = obj_pos[:, None, :, :].expand(B, K, A, 2).reshape(B * K, A, 2)
-        map_pos_exp = map_pos[:, None, :, :].expand(B, K, M, 2).reshape(B * K, M, 2)
-        center_feat_flat = center_feat.reshape(B * K, D)
-        center_type_flat = center_obj_type.reshape(B * K)
-
-        # Build agent-centric enc_out for MTR decoder
-        ac_enc_out = {
-            "obj_feature": obj_feat_exp,
-            "map_feature": map_feat_exp,
-            "center_objects_feature": center_feat_flat,
-            "obj_mask": obj_mask_exp,
-            "map_mask": map_mask_exp,
-            "obj_pos": obj_pos_exp,
-            "map_pos": map_pos_exp,
+        pred_list = self.apply_transformer_decoder(
+            center_feature,
+            center_type,
+            center_pos,
+            center_heading,
+            obj_proj,
+            obj_mask,
+            obj_pos,
+            map_proj,
+            map_mask,
+            map_pos,
+        )
+        self.forward_ret_dict["pred_list"] = pred_list
+        pred_scores, pred_trajs = self.generate_final_prediction(pred_list)
+        return {
+            "pred_scores": pred_scores if not self.training else pred_list[-1][0],
+            "pred_trajs": pred_trajs if not self.training else pred_list[-1][1],
+            "pred_list": [(s, t) for s, t in pred_list],
+            "pred_dense_trajs": pred_dense,
+            "intention_points": self.forward_ret_dict["intention_points"],
+            "track_index_to_predict": ttp,
+            "pred_is_target_agents": True,
         }
-        ac_batch = {"center_obj_type": center_type_flat}
-
-        # Run MTR decoder
-        dec_out = self.mtr_decoder(ac_enc_out, ac_batch)
-
-        # Reshape outputs back to [B, K, ...]
-        result: dict[str, Tensor] = {}
-
-        pred_trajs = dec_out["pred_trajs"]  # [B*K, modes, T, 7]
-        pred_scores = dec_out["pred_scores"]  # [B*K, modes]
-        modes = pred_trajs.shape[1]
-        T = pred_trajs.shape[2]
-
-        result["pred_trajs"] = pred_trajs.reshape(B, K, modes, T, 7)
-        result["pred_scores"] = pred_scores.reshape(B, K, modes)
-
-        # Pass through per-layer predictions for per-layer loss (avoids DDP unused params)
-        if "pred_list" in dec_out:
-            reshaped_list: list[tuple[Tensor, Tensor]] = []
-            for scores_i, trajs_i in dec_out["pred_list"]:
-                Q_i = scores_i.shape[1]
-                T_i = trajs_i.shape[2]
-                reshaped_list.append(
-                    (
-                        scores_i.reshape(B, K, Q_i),
-                        trajs_i.reshape(B, K, Q_i, T_i, 7),
-                    )
-                )
-            result["pred_list"] = reshaped_list
-
-        # Pass through dense future prediction for auxiliary loss
-        if "pred_dense_trajs" in dec_out:
-            dense = dec_out["pred_dense_trajs"]  # [B*K, A, T, 7]
-            result["pred_dense_trajs"] = dense.reshape(B, K, A, dense.shape[2], 7)
-
-        return result

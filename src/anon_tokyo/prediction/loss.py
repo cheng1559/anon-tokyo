@@ -115,7 +115,7 @@ def _dense_future_loss_scene(
     """Dense future prediction loss for scene-centric models.
 
     Same computation as ``_dense_future_loss`` but with ``[B, A, T, ...]``
-    layout instead of ``[K, A, T, ...]``.
+    layout instead of ``[K, A, T, ...]``.  Targets are agent-local futures.
     """
     B, A, T, _ = pred_dense.shape
     pred_gmm = pred_dense[:, :, :, 0:5]
@@ -139,6 +139,26 @@ def _dense_future_loss_scene(
     return loss_per_sample.mean()
 
 
+def _gather_tracks_if_all_agents(
+    tensor: Tensor,
+    batch: dict[str, Tensor],
+    *,
+    pred_is_target_agents: bool = False,
+) -> Tensor:
+    """Gather ``tracks_to_predict`` when a scene-centric tensor is ``[B, A, ...]``."""
+    if pred_is_target_agents:
+        return tensor
+    if "obj_types" not in batch:
+        return tensor
+    A = batch["obj_types"].shape[1]
+    if tensor.shape[1] != A:
+        return tensor
+    ttp = batch["tracks_to_predict"]
+    K = ttp.shape[1]
+    b_idx = torch.arange(tensor.shape[0], device=tensor.device)[:, None].expand(tensor.shape[0], K)
+    return tensor[b_idx, ttp.clamp(min=0)]
+
+
 def prediction_loss(
     output: dict[str, Tensor],
     batch: dict[str, Tensor],
@@ -148,9 +168,9 @@ def prediction_loss(
 
     Args:
         output: Model output with keys ``pred_trajs`` and ``pred_scores``.
-            - ``pred_trajs``: ``[B, K, num_modes, T, 7]``
+            - ``pred_trajs``: ``[B, A_or_K, num_modes, T, 7]``
               (μx, μy, log_σ1, log_σ2, ρ, vx, vy) in agent-local frame.
-            - ``pred_scores``: ``[B, K, num_modes]`` raw logits.
+            - ``pred_scores``: ``[B, A_or_K, num_modes]`` raw logits.
         batch: Collated batch with keys from transforms:
             - ``obj_trajs_future_local``: ``[B, A, T, 4]``
             - ``obj_trajs_future_mask``: ``[B, A, T]``
@@ -161,8 +181,13 @@ def prediction_loss(
         total_loss: scalar.
         loss_dict: per-component losses for logging.
     """
-    pred_trajs = output["pred_trajs"]  # [B, K, M, T, 7]
-    pred_scores = output["pred_scores"]  # [B, K, M]
+    pred_is_target_agents = bool(output.get("pred_is_target_agents", False))
+    pred_trajs = _gather_tracks_if_all_agents(
+        output["pred_trajs"], batch, pred_is_target_agents=pred_is_target_agents
+    )  # [B, K, M, T, 7]
+    pred_scores = _gather_tracks_if_all_agents(
+        output["pred_scores"], batch, pred_is_target_agents=pred_is_target_agents
+    )  # [B, K, M]
     B = pred_trajs.shape[0]
     K = pred_trajs.shape[1]
 
@@ -193,7 +218,13 @@ def prediction_loss(
     # Build layer list: pred_list contains ALL layers (including final);
     # fall back to single layer from pred_trajs/pred_scores when absent.
     if "pred_list" in output:
-        layers = output["pred_list"]
+        layers = [
+            (
+                _gather_tracks_if_all_agents(sc, batch, pred_is_target_agents=pred_is_target_agents),
+                _gather_tracks_if_all_agents(tr, batch, pred_is_target_agents=pred_is_target_agents),
+            )
+            for sc, tr in output["pred_list"]
+        ]
     else:
         layers = [(pred_scores, pred_trajs)]
 
@@ -207,14 +238,12 @@ def prediction_loss(
         cls_i = score_loss(sc_i, win_i)
         vel_i = velocity_loss(tr_i[:, :, :, :, 5:7], gt_vel, gt_mask, win_i)
 
-        # reg_i, vel_i: [B, K] summed over T;  cls_i: [B, K]
-        # Mask invalid agents, then reduce exactly like MTR:
-        #   (w_reg * reg + w_vel * vel).mean() + w_cls * cls.sum()
-        masked_reg = (reg_i * agent_valid).reshape(-1)
-        masked_vel = (vel_i * agent_valid).reshape(-1)
-        masked_cls = (cls_i * agent_valid).reshape(-1)
+        masked_reg = reg_i * agent_valid
+        masked_vel = vel_i * agent_valid
+        masked_cls = cls_i * agent_valid
 
-        layer_loss = (w_reg * masked_reg + w_vel * masked_vel).mean() + w_cls * masked_cls.sum()
+        per_agent = w_reg * masked_reg + w_vel * masked_vel + w_cls * masked_cls
+        layer_loss = per_agent.sum() / valid_count
         total_decoder_loss = total_decoder_loss + layer_loss
 
         loss_dict[f"loss/layer{i}"] = layer_loss.detach()
@@ -241,10 +270,13 @@ def prediction_loss(
     total_loss = total_decoder_loss
 
     # Dense future prediction auxiliary loss
-    if "pred_dense_trajs" in output and "obj_trajs_future" in batch:
+    if "pred_dense_trajs" in output:
+        pred_dense = output["pred_dense_trajs"]
+        if pred_dense.ndim == 5:
+            pred_dense = pred_dense[:, 0]
         dense_loss = _dense_future_loss_scene(
-            output["pred_dense_trajs"][:, 0],
-            batch["obj_trajs_future"],
+            pred_dense,
+            batch["obj_trajs_future_local"],
             batch["obj_trajs_future_mask"],
         )
         total_loss = total_loss + dense_loss

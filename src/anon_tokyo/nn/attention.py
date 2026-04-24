@@ -4,9 +4,9 @@ Each query attends only to its *k* nearest neighbours (by Euclidean
 distance on 2-D positions).  Even-indexed heads use Position-RoPE;
 odd-indexed heads use Heading-DRoPE.
 
-When both ``use_rope`` and ``use_drope`` are False, the layer falls back
-to additive sinusoidal PE (matching the DRoPE ablation / sinusoidal
-baseline config).
+``position_encoding`` controls how coordinates/headings enter attention:
+``rope_drope`` splits heads by parity, ``rope`` and ``drope`` apply one
+encoding to every head, and ``sine`` uses additive sinusoidal PE.
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ class SparseTopKAttention(nn.Module):
         dropout: float = 0.1,
         use_rope: bool = True,
         use_drope: bool = True,
+        position_encoding: str | None = None,
     ) -> None:
         super().__init__()
         assert d_model % num_heads == 0
@@ -81,8 +82,20 @@ class SparseTopKAttention(nn.Module):
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
         self.sparse_k = sparse_k
-        self.use_rope = use_rope
-        self.use_drope = use_drope
+        if position_encoding is None:
+            if use_rope and use_drope:
+                position_encoding = "rope_drope"
+            elif use_rope:
+                position_encoding = "rope"
+            elif use_drope:
+                position_encoding = "drope"
+            else:
+                position_encoding = "sine"
+        if position_encoding not in {"rope_drope", "rope", "drope", "sine"}:
+            raise ValueError(f"Unsupported position_encoding: {position_encoding}")
+        self.position_encoding = position_encoding
+        self.use_rope = position_encoding in {"rope_drope", "rope"}
+        self.use_drope = position_encoding in {"rope_drope", "drope"}
         self.scale = 1.0 / math.sqrt(self.d_head)
 
         self.q_proj = nn.Linear(d_model, d_model)
@@ -91,7 +104,7 @@ class SparseTopKAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
 
-        if not use_rope and not use_drope:
+        if position_encoding == "sine":
             self.fallback_pe = nn.Linear(d_model, d_model, bias=False)
 
     def forward(
@@ -152,7 +165,7 @@ class SparseTopKAttention(nn.Module):
         K = K.reshape(B, N_q, actual_k, H, d_h)
         V = V.reshape(B, N_q, actual_k, H, d_h)
 
-        if self.use_rope or self.use_drope:
+        if self.position_encoding != "sine":
             # Per-head RoPE / DRoPE
             q_heads = []
             k_heads = []
@@ -160,17 +173,14 @@ class SparseTopKAttention(nn.Module):
                 qh = Q[:, :, h, :]  # [B, N_q, d_h]
                 kh = K[:, :, :, h, :]  # [B, N_q, k, d_h]
 
-                if h % 2 == 0 and self.use_rope:
-                    # Position-RoPE on even heads
+                if self.position_encoding == "rope" or (self.position_encoding == "rope_drope" and h % 2 == 0):
                     pos_q_exp = pos_q  # [B, N_q, 2]
                     pos_k_exp = pos_k_gathered  # [B, N_q, k, 2]
-                    # Expand Q for broadcasting: treat each (N_q item, k neighbours)
                     qh_exp = qh.unsqueeze(2).expand_as(kh)  # [B, N_q, k, d_h]
                     qh_rot, kh_rot = apply_rope_2d(qh_exp, kh, pos_q_exp.unsqueeze(2).expand_as(pos_k_exp), pos_k_exp)
                     q_heads.append(qh_rot)
                     k_heads.append(kh_rot)
-                elif h % 2 == 1 and self.use_drope:
-                    # Heading-DRoPE on odd heads
+                elif self.position_encoding == "drope" or (self.position_encoding == "rope_drope" and h % 2 == 1):
                     hd_q = heading_q  # [B, N_q]
                     hd_k = heading_k_gathered  # [B, N_q, k]
                     qh_exp = qh.unsqueeze(2).expand_as(kh)  # [B, N_q, k, d_h]
@@ -178,7 +188,6 @@ class SparseTopKAttention(nn.Module):
                     q_heads.append(qh_rot)
                     k_heads.append(kh_rot)
                 else:
-                    # No encoding for this head (e.g. use_drope=False on odd heads)
                     q_heads.append(qh.unsqueeze(2).expand_as(kh))
                     k_heads.append(kh)
 
@@ -205,9 +214,6 @@ class SparseTopKAttention(nn.Module):
         attn_weights = self.attn_drop(attn_weights)
 
         # Weighted sum of values: [B, N_q, k, H, d_h] → [B, N_q, H, d_h]
-        out = (attn_weights.unsqueeze(-1) * V.transpose(2, 3).transpose(2, 3)).sum(dim=2)
-        # More clearly:
-        # V: [B, N_q, k, H, d_h], weights: [B, N_q, k, H, 1]
         out = (attn_weights.unsqueeze(-1) * V).sum(dim=2)  # [B, N_q, H, d_h]
 
         out = out.reshape(B, N_q, D)
