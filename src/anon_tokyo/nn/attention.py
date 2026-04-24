@@ -140,9 +140,6 @@ class SparseTopKAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
 
-        if position_encoding == "sine":
-            self.fallback_pe = nn.Linear(d_model, d_model, bias=False)
-
     def forward(
         self,
         q_feat: Tensor,
@@ -228,7 +225,7 @@ class SparseTopKAttention(nn.Module):
             pe_q = _sinusoidal_pe(pos_q, self.d_model)  # [B, N_q, D]
             pe_k = _sinusoidal_pe(pos_k_gathered.reshape(B, N_q * actual_k, 2), self.d_model)
             pe_k = pe_k.reshape(B, N_q, actual_k, D)
-            Q_pe = (Q.reshape(B, N_q, D) + self.fallback_pe(pe_q)).reshape(B, N_q, H, d_h)
+            Q_pe = (Q.reshape(B, N_q, D) + pe_q).reshape(B, N_q, H, d_h)
             K_pe = (K.reshape(B, N_q, actual_k, D) + pe_k).reshape(B, N_q, actual_k, H, d_h)
             # [B, N_q, 1, H, d_h] * [B, N_q, k, H, d_h] → [B, N_q, k, H]
             attn_logits = (Q_pe.unsqueeze(2) * K_pe).sum(dim=-1) * self.scale
