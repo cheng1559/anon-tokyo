@@ -32,14 +32,14 @@ model:
     class_path: anon_tokyo.prediction.anon_tokyo.model.AnonTokyoModel
     init_args:
       d_model: 256
-      num_encoder_layers: 2
+      num_encoder_layers: 6
       num_decoder_layers: 6
       d_decoder: 512
       map_d_model: 256
       num_heads: 8
-      sparse_k: 16
-      use_local_attn: true
-      num_attn_neighbors: 16
+      sparse_k: 32
+      # use_local_attn: true
+      # num_attn_neighbors: 16
       num_modes: 6
       num_intention_queries: 64
       num_future_frames: 80
