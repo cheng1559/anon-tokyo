@@ -424,9 +424,8 @@ def mtr_prediction_loss(
         # Classification loss
         loss_cls = F.cross_entropy(scores, positive_idx, reduction="none")
 
-        # Official MTR: loss_cls.sum(dim=-1) on [K] gives scalar, broadcast
-        # into per-sample reg+vel before .mean() → cls effective weight ×K.
-        layer_loss = (w_reg * loss_reg + w_vel * loss_vel).mean() + w_cls * loss_cls.sum()
+        # Official MTR builds a per-center loss vector, then averages it.
+        layer_loss = (w_reg * loss_reg + w_vel * loss_vel + w_cls * loss_cls).mean()
         total_decoder_loss = total_decoder_loss + layer_loss
 
         # Per-layer detailed logging (matches official tb_dict keys)

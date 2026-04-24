@@ -25,6 +25,7 @@ class PredictionModule(L.LightningModule):
         scheduler_kwargs: dict[str, Any] | None = None,
         loss_weights: dict[str, float] | None = None,
         compile_model: bool = False,
+        train_metrics_interval: int = 100,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -40,6 +41,7 @@ class PredictionModule(L.LightningModule):
             "warmup_ratio": 0.1,
             "eta_min": 1e-6,
         }
+        self.train_metrics_interval = train_metrics_interval
 
     # ── Training ──────────────────────────────────────────────────────────
 
@@ -65,8 +67,9 @@ class PredictionModule(L.LightningModule):
         )
         self.log("train/loss", loss_dict["loss/total"], prog_bar=True, batch_size=bs)
 
-        # Compute trajectory metrics periodically (every N steps to avoid overhead)
-        if self._is_agent_centric(output):
+        # Compute trajectory metrics periodically to avoid extra per-step work.
+        log_train_metrics = self.train_metrics_interval > 0 and batch_idx % self.train_metrics_interval == 0
+        if log_train_metrics and self._is_agent_centric(output):
             with torch.no_grad():
                 pred_trajs = output["pred_trajs"]
                 pred_scores = output["pred_scores"]
@@ -85,7 +88,7 @@ class PredictionModule(L.LightningModule):
                         on_epoch=False,
                         batch_size=bs,
                     )
-        else:
+        elif log_train_metrics:
             with torch.no_grad():
                 B = output["pred_trajs"].shape[0]
                 K = output["pred_trajs"].shape[1]

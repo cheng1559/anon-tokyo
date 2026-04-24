@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from anon_tokyo.data.shard_io import ShardIndex, read_item
+from anon_tokyo.data.mtr_transform import official_mtr_transform
 from anon_tokyo.data.transforms import scene_centric_transform
 
 
@@ -29,11 +30,13 @@ class WOMDDataset(Dataset):
         num_points_per_polyline: int = 20,
         use_npz: bool = False,
         npz_root: str | Path | None = None,
+        transform: str = "scene",
     ) -> None:
         self.max_agents = max_agents
         self.max_polylines = max_polylines
         self.num_points_per_polyline = num_points_per_polyline
         self.use_npz = use_npz
+        self.transform = transform
 
         self.split_dir = Path(data_root) / split
         self.index = ShardIndex.load(self.split_dir / "index.json")
@@ -73,6 +76,13 @@ class WOMDDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         data = self._load_raw(idx)
 
+        if self.transform == "mtr_official":
+            sample = official_mtr_transform(
+                data,
+                max_polylines=self.max_polylines,
+                num_points_per_polyline=self.num_points_per_polyline,
+            )
+            return sample  # collate_official_mtr handles numpy arrays directly
         sample = scene_centric_transform(
             data,
             max_agents=self.max_agents,

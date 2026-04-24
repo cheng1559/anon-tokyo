@@ -17,8 +17,8 @@ trainer:
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        monitor: val/loss/total
-        mode: min
+        monitor: val/mAP
+        mode: max
         save_top_k: 3
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
@@ -40,7 +40,12 @@ model:
       num_modes: 6
       num_intention_queries: 64
       num_future_frames: 80
-      intention_points_file: data/intention_points.pkl
+      intention_points_file: reference-code/mtr/data/waymo/cluster_64_center_dict.pkl
+      use_local_attn: true
+      num_attn_neighbors: 16
+      center_offset_of_map: [30.0, 0.0]
+      num_base_map_polylines: 256
+      num_waypoint_map_polylines: 128
   optimizer_class: torch.optim.AdamW
   optimizer_kwargs:
     lr: 1.0e-4
@@ -63,3 +68,4 @@ data:
   max_polylines: 768
   use_npz: true
   npz_root: data/processed
+  transform: mtr_official

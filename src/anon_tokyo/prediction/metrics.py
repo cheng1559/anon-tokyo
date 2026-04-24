@@ -1,8 +1,13 @@
-"""WOMD evaluation metrics: minADE, minFDE, MissRate.
+"""WOMD-compatible validation metrics: minADE, minFDE, MissRate.
 
 Aligned with MTR official ``get_ade_of_waymo``:
   - 80-frame predictions are downsampled to 2 Hz (every 5th frame starting at 4).
   - ADE is computed at three horizons (step 5 / 9 / 15) then averaged.
+
+``mAP`` here is a lightweight checkpoint-monitor proxy.  The official WOMD
+mAP implementation depends on the Waymo eval API, which is intentionally kept
+out of the Lightning training process for version compatibility.  Use
+``scripts/eval_womd.py`` for true official mAP after exporting predictions.
 """
 
 from __future__ import annotations
@@ -33,7 +38,9 @@ def compute_prediction_metrics(
         gt_mask: ``[B, K, T]`` — valid mask.
 
     Returns:
-        dict with keys ``minADE``, ``minFDE``, ``MissRate`` — each ``[B, K]``.
+        dict with keys ``minADE``, ``minFDE``, ``MissRate``, ``mAP`` — each
+        ``[B, K]``.  ``mAP`` is a bounded validation proxy, not the official
+        Waymo mAP.
     """
     T = pred_trajs.shape[3]
 
@@ -71,10 +78,15 @@ def compute_prediction_metrics(
     # MissRate: all modes miss if their FDE > threshold
     miss = (fde > miss_threshold).all(dim=-1).float()  # [B, K]
 
+    # Compatibility monitor for configs that follow official MTR's mAP-based
+    # checkpoint selection but cannot import the Waymo metric API in-process.
+    map_proxy = torch.exp(-min_ade).mul(1.0 - miss).clamp(0.0, 1.0)
+
     return {
         "minADE": min_ade,
         "minFDE": min_fde,
         "MissRate": miss,
+        "mAP": map_proxy,
     }
 
 

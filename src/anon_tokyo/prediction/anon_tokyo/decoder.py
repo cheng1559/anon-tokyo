@@ -50,6 +50,7 @@ class AnonTokyoDecoder(nn.Module):
             num_intention_queries=num_intention_queries,
             intention_points_file=intention_points_file,
             nms_dist_thresh=nms_dist_thresh,
+            keep_query_pos_all=True,
         )
 
     def forward(

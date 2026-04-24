@@ -85,7 +85,38 @@ def _process_agent_centric(
 ) -> list[dict]:
     """Collect predictions from MTR (agent-centric) model output."""
     pred_trajs = output["pred_trajs"]  # [K_total, M, T, 7]
-    pred_scores = torch.softmax(output["pred_scores"], dim=-1)  # [K_total, M]
+    # MTR decoder returns softmaxed/NMS scores in eval mode, matching official.
+    pred_scores = output["pred_scores"]  # [K_total, M]
+    if "input_dict" in batch:
+        input_dict = batch["input_dict"]
+        center_world = input_dict["center_objects_world"].to(device)
+        pred_world = pred_trajs.clone()
+        h = center_world[:, 6]
+        c, s = torch.cos(h), torch.sin(h)
+        x, y = pred_world[..., 0].clone(), pred_world[..., 1].clone()
+        pred_world[..., 0] = x * c[:, None, None] - y * s[:, None, None] + center_world[:, None, None, 0]
+        pred_world[..., 1] = x * s[:, None, None] + y * c[:, None, None] + center_world[:, None, None, 1]
+
+        results: list[dict] = []
+        scenario_ids = input_dict["scenario_id"]
+        center_ids = input_dict["center_objects_id"]
+        center_types = input_dict["center_objects_type"]
+        gt_src = input_dict["center_gt_trajs_src"]
+        for k in range(pred_world.shape[0]):
+            ctype = int(center_types[k]) if not isinstance(center_types[k], str) else center_types[k]
+            results.append(
+                {
+                    "scenario_id": str(scenario_ids[k]),
+                    "pred_trajs": pred_world[k, :, :, 0:2].cpu().numpy(),
+                    "pred_scores": pred_scores[k].cpu().numpy(),
+                    "object_id": int(center_ids[k]),
+                    "object_type": INT_TO_WOMD_TYPE.get(ctype, str(ctype)),
+                    "gt_trajs": gt_src[k].cpu().numpy(),
+                    "track_index_to_predict": k,
+                }
+            )
+        return results
+
     track_idx = output["track_index_to_predict"]  # [K_total]
     batch_sample_count = output["batch_sample_count"]  # [B]
 
@@ -202,8 +233,10 @@ def main() -> None:
         num_workers=args.num_workers,
         max_agents=data_cfg.get("max_agents", 128),
         max_polylines=data_cfg.get("max_polylines", 768),
+        num_points_per_polyline=data_cfg.get("num_points_per_polyline", 20),
         use_npz=data_cfg.get("use_npz", False),
         npz_root=data_cfg.get("npz_root"),
+        transform=data_cfg.get("transform", "scene"),
     )
     stage = "validate" if args.split == "validation" else "test"
     dm.setup(stage)
@@ -211,8 +244,15 @@ def main() -> None:
     npz_root = Path(args.npz_root) / args.split
 
     all_preds: list[dict] = []
+    def to_device(x):
+        if isinstance(x, Tensor):
+            return x.to(args.device)
+        if isinstance(x, dict):
+            return {k: to_device(v) for k, v in x.items()}
+        return x
+
     for batch in tqdm(dataloader, desc="Predicting"):
-        batch_dev = {k: v.to(args.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
+        batch_dev = to_device(batch)
         with torch.no_grad():
             output = lit_module.model(batch_dev)
 

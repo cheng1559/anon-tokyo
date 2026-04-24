@@ -9,6 +9,7 @@ import lightning as L
 import torch
 from torch.utils.data import DataLoader
 
+from anon_tokyo.data.mtr_transform import collate_official_mtr
 from anon_tokyo.data.womd_dataset import WOMDDataset
 
 
@@ -35,6 +36,7 @@ class WOMDDataModule(L.LightningDataModule):
         num_points_per_polyline: int = 20,
         use_npz: bool = False,
         npz_root: str | None = None,
+        transform: str = "scene",
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -48,7 +50,12 @@ class WOMDDataModule(L.LightningDataModule):
             num_points_per_polyline=num_points_per_polyline,
             use_npz=use_npz,
             npz_root=npz_root,
+            transform=transform,
         )
+        self.transform = transform
+
+    def _collate_fn(self):
+        return collate_official_mtr if self.transform == "mtr_official" else collate_fn
 
     def setup(self, stage: str | None = None) -> None:
         if stage in (None, "fit"):
@@ -65,7 +72,7 @@ class WOMDDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=self._collate_fn(),
             pin_memory=True,
             drop_last=True,
             persistent_workers=self.num_workers > 0,
@@ -77,7 +84,7 @@ class WOMDDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=self._collate_fn(),
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
         )
@@ -88,6 +95,6 @@ class WOMDDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=self._collate_fn(),
             pin_memory=True,
         )

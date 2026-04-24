@@ -34,4 +34,4 @@ Thumbs.db
 # Reference code
 reference-code
 assets/paper
-predictions.pkl
+*.pkl
