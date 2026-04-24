@@ -143,6 +143,7 @@ class TestPredictionLoss:
         output = {
             "pred_trajs": torch.randn(B, K, M, T, 7, requires_grad=True),
             "pred_scores": torch.randn(B, K, M, requires_grad=True),
+            "intention_points": torch.randn(B, K, M, 2),
         }
         batch = {
             "obj_trajs_future_local": torch.randn(B, A, T, 4),
@@ -172,6 +173,7 @@ class TestPredictionLoss:
         output = {
             "pred_trajs": torch.randn(B, K, M, T, 7, requires_grad=True),
             "pred_scores": torch.randn(B, K, M, requires_grad=True),
+            "intention_points": torch.randn(B, K, M, 2),
             "pred_dense_trajs": torch.randn(B, K, A, T, 7, requires_grad=True),
         }
         batch = {
@@ -191,7 +193,7 @@ class TestPredictionLoss:
         B, K, M, T, A = 1, 1, 2, 10, 4
         pred_trajs = torch.randn(B, K, M, T, 7, requires_grad=True)
         pred_scores = torch.randn(B, K, M, requires_grad=True)
-        output = {"pred_trajs": pred_trajs, "pred_scores": pred_scores}
+        output = {"pred_trajs": pred_trajs, "pred_scores": pred_scores, "intention_points": torch.randn(B, K, M, 2)}
         batch = {
             "obj_trajs_future_local": torch.randn(B, A, T, 4),
             "obj_trajs_future_mask": torch.ones(B, A, T),

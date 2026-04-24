@@ -188,6 +188,9 @@ def prediction_loss(
     pred_scores = _gather_tracks_if_all_agents(
         output["pred_scores"], batch, pred_is_target_agents=pred_is_target_agents
     )  # [B, K, M]
+    intention_points = _gather_tracks_if_all_agents(
+        output["intention_points"], batch, pred_is_target_agents=pred_is_target_agents
+    )  # [B, K, M, 2]
     B = pred_trajs.shape[0]
     K = pred_trajs.shape[1]
 
@@ -206,6 +209,14 @@ def prediction_loss(
 
     gt_xy = gt_trajs[:, :, :, 0:2]
     gt_vel = gt_trajs[:, :, :, 2:4]
+
+    # Match MTR: the positive mode is the intention point closest to the
+    # target's last valid local-frame GT position, and remains fixed per layer.
+    idx_range = torch.arange(gt_mask.shape[2], device=gt_mask.device)
+    last_valid = (idx_range.view(1, 1, -1) * gt_mask).max(dim=-1).values.long().clamp(min=0)
+    gt_goals = gt_xy[b_idx, torch.arange(K, device=gt_xy.device)[None, :].expand(B, K), last_valid]
+    ip_dist = (gt_goals[:, :, None, :] - intention_points).norm(dim=-1)
+    positive_idx = ip_dist.argmin(dim=-1)  # [B, K]
 
     # Mask out invalid tracks_to_predict padding
     agent_valid = ttp_mask[:, :K].float()
@@ -234,9 +245,17 @@ def prediction_loss(
 
     for i, (sc_i, tr_i) in enumerate(layers):
         gmm_i = tr_i[:, :, :, :, 0:5]
-        reg_i, win_i = nll_loss_gmm(gmm_i, gt_xy, gt_mask)
-        cls_i = score_loss(sc_i, win_i)
-        vel_i = velocity_loss(tr_i[:, :, :, :, 5:7], gt_vel, gt_mask, win_i)
+        flat_positive_idx = positive_idx.reshape(B * K)
+        reg_flat, flat_positive_idx = _nll_loss_gmm_flat(
+            gmm_i.reshape(B * K, gmm_i.shape[2], gmm_i.shape[3], gmm_i.shape[4]),
+            gt_xy.reshape(B * K, gt_xy.shape[2], gt_xy.shape[3]),
+            gt_mask.reshape(B * K, gt_mask.shape[2]),
+            pre_winner_idx=flat_positive_idx,
+        )
+        positive_idx = flat_positive_idx.reshape(B, K)
+        reg_i = reg_flat.reshape(B, K)
+        cls_i = score_loss(sc_i, positive_idx)
+        vel_i = velocity_loss(tr_i[:, :, :, :, 5:7], gt_vel, gt_mask, positive_idx)
 
         masked_reg = reg_i * agent_valid
         masked_vel = vel_i * agent_valid
@@ -259,7 +278,7 @@ def prediction_loss(
                 center_types = batch["obj_types"][b_idx, ttp_clamped[:, :K]].reshape(BK)
                 _log_ade_per_type(
                     loss_dict,
-                    pred_xy=gmm_i[:, :, :, :, 0:2].reshape(BK, -1, gmm_i.shape[3], 2)[flat_valid],
+                    pred_xy=gmm_i[:, :, :, :, 0:2].detach().reshape(BK, -1, gmm_i.shape[3], 2)[flat_valid],
                     gt_xy=gt_xy.reshape(BK, -1, 2)[flat_valid],
                     gt_mask=gt_mask.reshape(BK, -1)[flat_valid],
                     obj_types=center_types[flat_valid],
