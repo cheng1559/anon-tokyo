@@ -34,6 +34,17 @@ def _local_xy_to_scene(local_xy: Tensor, agent_pos: Tensor, agent_heading: Tenso
     return torch.stack((scene_x, scene_y), dim=-1)
 
 
+def _rotate_local_vec_to_scene(local_vec: Tensor, agent_heading: Tensor) -> Tensor:
+    """Rotate local 2-D vectors into the scene frame without translation."""
+    extra_dims = local_vec.ndim - agent_heading.ndim - 1
+    view_shape = (*agent_heading.shape, *([1] * extra_dims))
+    c = agent_heading.cos().view(view_shape)
+    s = agent_heading.sin().view(view_shape)
+    x = local_vec[..., 0]
+    y = local_vec[..., 1]
+    return torch.stack((x * c - y * s, x * s + y * c), dim=-1)
+
+
 class AnonTokyoDecoder(MTRDecoder):
     """Target-agent query-centric decoder that reuses MTR-compatible decoder blocks."""
 
@@ -80,23 +91,44 @@ class AnonTokyoDecoder(MTRDecoder):
         sorted_idxs = sorted_idxs.masked_fill(~unique_mask, -1)
         return sorted_idxs.int()
 
-    def apply_dense_future_prediction(self, obj_feature: Tensor, obj_mask: Tensor, obj_pos: Tensor) -> tuple[Tensor, Tensor]:
+    def apply_dense_future_prediction(
+        self,
+        obj_feature: Tensor,
+        obj_mask: Tensor,
+        obj_pos: Tensor,
+        obj_heading: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         B, A, _ = obj_feature.shape
         valid = obj_mask.bool()
         obj_pos_valid = obj_pos[valid][..., 0:2]
+        if obj_heading is None:
+            obj_heading_valid = obj_pos_valid.new_zeros(obj_pos_valid.shape[0])
+        else:
+            obj_heading_valid = obj_heading[valid].to(dtype=obj_pos_valid.dtype)
         obj_feature_valid = obj_feature[valid]
         obj_pos_feature_valid = self.obj_pos_encoding_layer(obj_pos_valid)
-        pred_dense = self.dense_future_head(torch.cat((obj_pos_feature_valid, obj_feature_valid), dim=-1))
-        pred_dense = pred_dense.view(pred_dense.shape[0], self.num_future_frames, 7)
-        pred_dense = torch.cat((pred_dense[:, :, 0:2] + obj_pos_valid[:, None, 0:2], pred_dense[:, :, 2:]), dim=-1)
-        future_input = pred_dense[:, :, [0, 1, -2, -1]].flatten(1, 2)
+        pred_dense_local = self.dense_future_head(torch.cat((obj_pos_feature_valid, obj_feature_valid), dim=-1))
+        pred_dense_local = pred_dense_local.view(pred_dense_local.shape[0], self.num_future_frames, 7)
+        pred_dense_scene = torch.cat(
+            (
+                _local_xy_to_scene(
+                    pred_dense_local[:, None, :, 0:2],
+                    obj_pos_valid[:, None],
+                    obj_heading_valid[:, None],
+                ).squeeze(1),
+                pred_dense_local[:, :, 2:5],
+                _rotate_local_vec_to_scene(pred_dense_local[:, :, 5:7], obj_heading_valid),
+            ),
+            dim=-1,
+        )
+        future_input = pred_dense_local[:, :, [0, 1, -2, -1]].flatten(1, 2)
         future_feature = self.future_traj_mlps(future_input)
         obj_feature_valid = self.traj_fusion_mlps(torch.cat((obj_feature_valid, future_feature), dim=-1))
 
         ret_feature = torch.zeros_like(obj_feature)
         ret_feature[valid] = obj_feature_valid.to(dtype=ret_feature.dtype)
         ret_dense = obj_feature.new_zeros(B, A, self.num_future_frames, 7)
-        ret_dense[valid] = pred_dense.to(dtype=ret_dense.dtype)
+        ret_dense[valid] = pred_dense_scene.to(dtype=ret_dense.dtype)
         self.forward_ret_dict["pred_dense_trajs"] = ret_dense
         return ret_feature, ret_dense
 
@@ -255,7 +287,7 @@ class AnonTokyoDecoder(MTRDecoder):
         map_proj = self.in_proj_map(map_feature.flatten(0, 1)).view(B, num_polylines, -1)
         map_proj = map_proj * map_mask.unsqueeze(-1).type_as(map_proj)
 
-        obj_proj, pred_dense = self.apply_dense_future_prediction(obj_proj, obj_mask, obj_pos)
+        obj_proj, pred_dense = self.apply_dense_future_prediction(obj_proj, obj_mask, obj_pos, obj_heading)
 
         ttp = batch["tracks_to_predict"].long()
         K = ttp.shape[1]

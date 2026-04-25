@@ -1,7 +1,8 @@
 """AnonTokyo: query-centric prediction model (encoder + decoder).
 
-No per-agent coordinate transform — the encoder uses RoPE/DRoPE
-for spatial and rotational encoding directly in the global frame.
+The dataloader stays query-centric: one scene batch is encoded once, while
+agent-local history descriptors and scene-frame RoPE/DRoPE interactions are
+computed inside the model.
 """
 
 from __future__ import annotations
@@ -19,12 +20,12 @@ class AnonTokyoModel(nn.Module):
     def __init__(
         self,
         d_model: int = 256,
-        num_encoder_layers: int = 6,
+        num_encoder_layers: int = 2,
         num_decoder_layers: int = 6,
         d_decoder: int = 512,
         map_d_model: int | None = None,
         num_heads: int = 8,
-        sparse_k: int = 32,
+        sparse_k: int = 16,
         use_local_attn: bool = True,
         num_attn_neighbors: int | None = None,
         num_modes: int = 6,

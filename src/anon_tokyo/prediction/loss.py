@@ -293,9 +293,10 @@ def prediction_loss(
         pred_dense = output["pred_dense_trajs"]
         if pred_dense.ndim == 5:
             pred_dense = pred_dense[:, 0]
+        dense_gt_future = batch["obj_trajs_future"] if "obj_trajs_future" in batch else batch["obj_trajs_future_local"]
         dense_loss = _dense_future_loss_query(
             pred_dense,
-            batch["obj_trajs_future"],
+            dense_gt_future,
             batch["obj_trajs_future_mask"],
         )
         total_loss = total_loss + dense_loss
