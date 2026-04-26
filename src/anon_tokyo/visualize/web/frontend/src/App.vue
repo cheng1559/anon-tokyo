@@ -55,6 +55,7 @@ const showMap = ref(true)
 const showGroundTruth = ref(true)
 const showPredictions = ref(true)
 const selectedAgentId = ref<number | null>(null)
+const targetAgentsOnly = ref(false)
 const agentSignalTab = ref('reward')
 const isLoading = ref(false)
 const statusText = ref('Waiting for initialization...')
@@ -77,9 +78,10 @@ const simulationControlModeOptions = [
 
 const currentScenario = computed(() => batch.value?.scenarios[worldIndex.value] ?? null)
 const selectedAgentValue = computed({
-    get: () => (selectedAgentId.value === null ? 'all' : String(selectedAgentId.value)),
+    get: () => (targetAgentsOnly.value ? 'targets' : selectedAgentId.value === null ? 'all' : String(selectedAgentId.value)),
     set: (value: string) => {
-        selectedAgentId.value = value === 'all' ? null : Number(value)
+        targetAgentsOnly.value = value === 'targets'
+        selectedAgentId.value = value === 'all' || value === 'targets' ? null : Number(value)
     }
 })
 const sortedAgents = computed<Agent[]>(() => {
@@ -91,6 +93,11 @@ const sortedAgents = computed<Agent[]>(() => {
     })
 })
 const selectedAgent = computed(() => sortedAgents.value.find((agent) => agent.id === selectedAgentId.value) ?? null)
+const targetAgentIds = computed(() => new Set((currentScenario.value?.agents ?? []).filter((agent) => agent.target).map((agent) => agent.id)))
+const isVisibleAgent = (agentId: number) => {
+    if (targetAgentsOnly.value) return targetAgentIds.value.has(agentId)
+    return selectedAgentId.value === null || selectedAgentId.value === agentId
+}
 const maxFrame = computed(() => {
     const rollout = currentScenario.value?.rollout ?? []
     return Math.max(0, ...rollout.map((track) => track.points.length - 1))
@@ -98,11 +105,10 @@ const maxFrame = computed(() => {
 const selectedTrackCounts = computed(() => {
     const scenario = currentScenario.value
     if (!scenario) return { future: 0, predictions: 0, rollout: 0 }
-    const agentId = selectedAgentId.value
     return {
-        future: agentId === null ? scenario.agents.filter((agent) => agent.future.length > 0).length : selectedAgent.value?.future.length ? 1 : 0,
-        predictions: scenario.predictions?.filter((track) => agentId === null || track.agent_id === agentId).length ?? 0,
-        rollout: scenario.rollout?.filter((track) => agentId === null || track.agent_id === agentId).length ?? 0
+        future: scenario.agents.filter((agent) => isVisibleAgent(agent.id) && agent.future.length > 0).length,
+        predictions: scenario.predictions?.filter((track) => isVisibleAgent(track.agent_id)).length ?? 0,
+        rollout: scenario.rollout?.filter((track) => isVisibleAgent(track.agent_id)).length ?? 0
     }
 })
 const selectedRolloutTrack = computed(() => {
@@ -130,6 +136,11 @@ function flagAt(values: number[] | undefined, frameIdx: number, cumulative = fal
 
 function trackForAgent(agentId: number): RolloutTrack | undefined {
     return currentScenario.value?.rollout?.find((track) => track.agent_id === agentId)
+}
+
+function selectAgent(agentId: number) {
+    targetAgentsOnly.value = false
+    selectedAgentId.value = agentId
 }
 
 function agentState(agent: Agent): 'collision' | 'offroad' | 'goal' | 'controlled' | 'default' {
@@ -617,6 +628,7 @@ onBeforeUnmount(() => {
                             :show-ground-truth="showGroundTruth"
                             :show-map="showMap"
                             :show-predictions="showPredictions"
+                            :target-agents-only="targetAgentsOnly"
                         />
                     </ResizablePanel>
 
@@ -717,6 +729,7 @@ onBeforeUnmount(() => {
                                         </SelectTrigger>
                                         <SelectContent>
                                             <SelectItem value="all">All agents</SelectItem>
+                                            <SelectItem value="targets">Target agents</SelectItem>
                                             <SelectItem v-for="agent in sortedAgents" :key="agent.id" :value="String(agent.id)">
                                                 #{{ agent.id }} {{ agent.type }}{{ agent.target ? ' target' : agent.controlled ? ' controlled' : agent.sdc ? ' sdc' : '' }}
                                             </SelectItem>
@@ -743,7 +756,7 @@ onBeforeUnmount(() => {
                                         :key="agent.id"
                                         class="h-9 w-full justify-start gap-2"
                                         :variant="selectedAgentId === agent.id ? 'default' : 'ghost'"
-                                        @click="selectedAgentId = agent.id"
+                                        @click="selectAgent(agent.id)"
                                     >
                                         <span
                                             class="size-2.5 shrink-0 rounded-full ring-1 ring-black/15 ring-inset"

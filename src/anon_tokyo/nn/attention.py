@@ -1,4 +1,4 @@
-"""Sparse top-k multi-head attention with RoPE / DRoPE.
+"""Sparse top-k multi-head attention with RoPE / DRoPE / pairwise RPE.
 
 Each query attends only to its *k* nearest neighbours (by Euclidean
 distance on 2-D positions).  Even-indexed heads use Position-RoPE;
@@ -6,7 +6,8 @@ odd-indexed heads use Heading-DRoPE.
 
 ``position_encoding`` controls how coordinates/headings enter attention:
 ``rope_drope`` splits heads by parity, ``rope`` and ``drope`` apply one
-encoding to every head, and ``sine`` uses additive sinusoidal PE.
+encoding to every head, ``rpe`` uses pairwise relative-position attention
+bias, and ``sine`` uses additive sinusoidal PE.
 """
 
 from __future__ import annotations
@@ -73,6 +74,31 @@ def _sinusoidal_pe(pos: Tensor, d_model: int) -> Tensor:
     return torch.cat((pos_y, pos_x), dim=-1)
 
 
+def _pairwise_rpe_features(pos_q: Tensor, pos_k: Tensor, heading_q: Tensor, heading_k: Tensor) -> Tensor:
+    """Pairwise geometry features for relative-position attention bias.
+
+    Args:
+        pos_q:     ``[B, N_q, 2]``
+        pos_k:     ``[B, N_q, k, 2]``
+        heading_q: ``[B, N_q]``
+        heading_k: ``[B, N_q, k]``
+
+    Returns:
+        ``[B, N_q, k, 5]`` containing query-frame dx/dy, distance, and
+        sin/cos of the relative heading.
+    """
+    rel_xy = pos_k - pos_q.unsqueeze(2)
+    c = heading_q.cos().unsqueeze(-1)
+    s = heading_q.sin().unsqueeze(-1)
+    rel_x = rel_xy[..., 0]
+    rel_y = rel_xy[..., 1]
+    local_xy = torch.stack((rel_x * c + rel_y * s, -rel_x * s + rel_y * c), dim=-1)
+    dist = rel_xy.norm(dim=-1, keepdim=True)
+    rel_heading = heading_k - heading_q.unsqueeze(-1)
+    heading_feature = torch.stack((rel_heading.sin(), rel_heading.cos()), dim=-1)
+    return torch.cat((local_xy, dist, heading_feature), dim=-1)
+
+
 @torch.no_grad()
 def select_topk(
     pos_q: Tensor,
@@ -132,7 +158,9 @@ class SparseTopKAttention(nn.Module):
                 position_encoding = "drope"
             else:
                 position_encoding = "sine"
-        if position_encoding not in {"rope_drope", "rope", "drope", "sine"}:
+        if position_encoding == "pairwise_rpe":
+            position_encoding = "rpe"
+        if position_encoding not in {"rope_drope", "rope", "drope", "rpe", "sine"}:
             raise ValueError(f"Unsupported position_encoding: {position_encoding}")
         self.position_encoding = position_encoding
         self.use_rope = position_encoding in {"rope_drope", "rope"}
@@ -144,6 +172,12 @@ class SparseTopKAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
+        if self.position_encoding == "rpe":
+            self.rpe_bias = nn.Sequential(
+                nn.Linear(5, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, num_heads),
+            )
 
     def forward(
         self,
@@ -203,7 +237,7 @@ class SparseTopKAttention(nn.Module):
         K = K.reshape(B, N_q, actual_k, H, d_h)
         V = V.reshape(B, N_q, actual_k, H, d_h)
 
-        if self.position_encoding != "sine":
+        if self.position_encoding not in {"rpe", "sine"}:
             Q_all = Q.unsqueeze(2)
             K_all = K
             if self.position_encoding == "rope":
@@ -225,6 +259,10 @@ class SparseTopKAttention(nn.Module):
                 K_all = K_enc
 
             attn_logits = (Q_all * K_all).sum(dim=-1) * self.scale  # [B, N_q, k, H]
+        elif self.position_encoding == "rpe":
+            attn_logits = (Q.unsqueeze(2) * K).sum(dim=-1) * self.scale
+            rpe_features = _pairwise_rpe_features(pos_q, pos_k_gathered, heading_q, heading_k_gathered)
+            attn_logits = attn_logits + self.rpe_bias(rpe_features)
         else:
             # Fallback: additive sinusoidal PE
             pe_q = _sinusoidal_pe(pos_q, self.d_model)  # [B, N_q, D]

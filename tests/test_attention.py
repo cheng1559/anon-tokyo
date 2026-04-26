@@ -72,6 +72,12 @@ class TestSparseTopKAttention:
         out = layer(q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k)
         assert out.shape == (B, N_Q, D)
 
+    def test_output_shape_pairwise_rpe(self) -> None:
+        layer = SparseTopKAttention(d_model=D, num_heads=H, sparse_k=K, position_encoding="rpe")
+        q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k = _make_inputs()
+        out = layer(q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k)
+        assert out.shape == (B, N_Q, D)
+
     def test_output_shape_sinusoidal_fallback(self) -> None:
         layer = SparseTopKAttention(d_model=D, num_heads=H, sparse_k=K, use_rope=False, use_drope=False)
         q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k = _make_inputs()
@@ -112,6 +118,17 @@ class TestSparseTopKAttention:
         torch.manual_seed(42)
         layer = SparseTopKAttention(d_model=D, num_heads=H, sparse_k=K, use_rope=True, use_drope=True)
         layer.eval()  # deterministic dropout
+        q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k = _make_inputs()
+        offset = torch.randn(1, 1, 2) * 100
+
+        out1 = layer(q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k)
+        out2 = layer(q_feat, kv_feat, pos_q + offset, pos_k + offset, heading_q, heading_k, mask_k)
+        torch.testing.assert_close(out1, out2, atol=1e-4, rtol=1e-4)
+
+    def test_pairwise_rpe_translation_equivariance(self) -> None:
+        torch.manual_seed(42)
+        layer = SparseTopKAttention(d_model=D, num_heads=H, sparse_k=K, position_encoding="rpe")
+        layer.eval()
         q_feat, kv_feat, pos_q, pos_k, heading_q, heading_k, mask_k = _make_inputs()
         offset = torch.randn(1, 1, 2) * 100
 

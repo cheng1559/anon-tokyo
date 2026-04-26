@@ -35,7 +35,7 @@ const checkpointCandidates = computed(() => {
 
     const results = fuzzysort.go(q, all, {
         threshold: -10000,
-        limit: 200
+        limit: all.length
     })
     return results.map((r) => r.target)
 })
@@ -63,13 +63,13 @@ function reload() {
                         role="combobox"
                         variant="outline"
                     >
-                        <span class="truncate">
+                        <span class="truncate" :title="model || 'Select checkpoint...'">
                             {{ model || 'Select checkpoint...' }}
                         </span>
                         <Icon class="text-muted-foreground size-4" icon="lucide:chevrons-up-down" />
                     </Button>
                 </PopoverTrigger>
-                <PopoverContent class="max-h-96 w-auto p-2" align="start">
+                <PopoverContent class="max-h-96 w-[min(90vw,56rem)] p-2" align="start">
                     <div class="flex flex-col gap-2">
                         <Input v-model="checkpointQuery" class="h-9" placeholder="Search checkpoint..." />
                         <div class="scrollbar-none max-h-80 overflow-auto">
@@ -81,7 +81,7 @@ function reload() {
                                 type="button"
                                 @click="selectCheckpoint(checkpoint)"
                             >
-                                <span class="truncate">{{ checkpoint }}</span>
+                                <span class="min-w-0 break-all pr-2">{{ checkpoint }}</span>
                                 <Icon class="size-4" :class="model === checkpoint ? 'opacity-100' : 'opacity-0'" icon="lucide:check" />
                             </button>
                         </div>

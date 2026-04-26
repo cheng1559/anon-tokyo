@@ -21,6 +21,7 @@ const props = defineProps<{
   showGroundTruth: boolean
   showPredictions: boolean
   selectedAgentId?: number | null
+  targetAgentsOnly?: boolean
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -265,6 +266,9 @@ function drawScoreLabel(ctx: CanvasRenderingContext2D, text: string, point: numb
 }
 
 function isSelectedAgent(agentId: number) {
+  if (props.targetAgentsOnly) {
+    return Boolean(props.scenario?.agents.find((agent) => agent.id === agentId)?.target)
+  }
   return props.selectedAgentId === null || props.selectedAgentId === undefined || props.selectedAgentId === agentId
 }
 
@@ -521,7 +525,7 @@ watch(
     resetView()
   }
 )
-watch(() => [props.frame, props.showMap, props.showGroundTruth, props.showPredictions, props.selectedAgentId, currentThemeId.value], draw)
+watch(() => [props.frame, props.showMap, props.showGroundTruth, props.showPredictions, props.selectedAgentId, props.targetAgentsOnly, currentThemeId.value], draw)
 
 onMounted(() => {
   window.addEventListener('resize', resize)

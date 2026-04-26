@@ -28,6 +28,7 @@ from anon_tokyo.simulation.profiling import TimingProfiler
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Closed-loop PPO training")
     parser.add_argument("--config", type=str, default="configs/simulation/agent_centric_ppo.yaml")
+    parser.add_argument("--version", type=str, default=None, help="Experiment version under trainer save_dir/name, PL-style")
     parser.add_argument("--policy_class", type=str, default=None, help="Override model.class_path, e.g. package.module.Class")
     parser.add_argument("--num_updates", type=int, default=None)
     parser.add_argument("--data_root", type=str, default=None)
@@ -59,6 +60,12 @@ def setup_distributed() -> tuple[bool, int, int, int, torch.device]:
     if is_distributed:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP training requires CUDA in this entrypoint")
+        cuda_device_count = torch.cuda.device_count()
+        if local_rank >= cuda_device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is out of range for {cuda_device_count} visible CUDA device(s). "
+                "Lower --nproc_per_node or set CUDA_VISIBLE_DEVICES to expose enough GPUs."
+            )
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
         device = torch.device(f"cuda:{local_rank}")
@@ -138,6 +145,8 @@ def build_policy(cfg: dict[str, Any], override_class: str | None) -> torch.nn.Mo
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    if args.version is not None:
+        cfg.setdefault("trainer", {})["version"] = args.version
     if args.num_updates is not None:
         cfg.setdefault("ppo", {})["num_updates"] = args.num_updates
     if args.data_root is not None:
@@ -205,6 +214,37 @@ def warn_single_process_heavy_config(cfg: dict[str, Any], world_size: int) -> No
                 "minibatch_size": minibatch_size,
             }
         )
+
+
+def resolve_log_dir(cfg: dict[str, Any]) -> Path:
+    """Resolve simulation logs like TensorBoardLogger: save_dir/name/version."""
+    trainer_cfg = dict(cfg.get("trainer") or {})
+    logger_cfg = trainer_cfg.get("logger") if isinstance(trainer_cfg.get("logger"), dict) else {}
+    logger_init_args = logger_cfg.get("init_args") if isinstance(logger_cfg.get("init_args"), dict) else {}
+
+    version = trainer_cfg.get("version", logger_init_args.get("version"))
+    save_dir = trainer_cfg.get("save_dir", logger_init_args.get("save_dir"))
+    name = trainer_cfg.get("name", logger_init_args.get("name"))
+    configured_log_dir = trainer_cfg.get("log_dir")
+
+    if version not in (None, ""):
+        if save_dir is None or name is None:
+            if configured_log_dir is not None:
+                base = Path(configured_log_dir)
+                save_dir = base.parent
+                name = base.name
+            else:
+                save_dir = "tb_logs"
+                name = "simulation"
+        return Path(save_dir) / str(name) / str(version)
+
+    if configured_log_dir is not None:
+        return Path(configured_log_dir)
+
+    if save_dir is not None and name is not None:
+        return Path(save_dir) / str(name)
+
+    return Path("tb_logs") / "simulation"
 
 
 def main() -> None:
@@ -289,9 +329,10 @@ def main() -> None:
                     "batches_per_epoch": len(loader),
                     "total_epochs": ppo_cfg.total_epochs,
                     "num_updates": ppo_cfg.num_updates,
+                    "log_dir": str(resolve_log_dir(cfg)),
                 }
             )
-        log_dir = Path(cfg.get("trainer", {}).get("log_dir", "tb_logs/simulation"))
+        log_dir = resolve_log_dir(cfg)
         if is_rank_zero(rank):
             log_dir.mkdir(parents=True, exist_ok=True)
             writer = SummaryWriter(log_dir=str(log_dir))

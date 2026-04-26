@@ -6,6 +6,11 @@ export type ThemeEntry = {
 
 export const THEMES: ThemeEntry[] = [
     {
+        id: 'anon',
+        label: 'Anon',
+        cssPath: new URL('../assets/themes/anon.css', import.meta.url).toString()
+    },
+    {
         id: 'hermes-default',
         label: 'Hermes Default',
         cssPath: new URL('../assets/themes/hermes-default.css', import.meta.url).toString()

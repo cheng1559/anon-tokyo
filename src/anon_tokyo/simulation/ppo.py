@@ -279,30 +279,35 @@ class PPOTrainer:
                     logratio = new_logprob.float() - old_logprob
                     ratio = logratio.exp()
                     mask = buffer.train_masks[step_idx, env_idx]
-                    if not mask.any():
-                        continue
+                    has_valid = mask.any()
+                    if has_valid:
+                        mb_adv = advantages[step_idx, env_idx]
+                        if self.config.norm_adv:
+                            mb_adv = (mb_adv - masked_mean(mb_adv, mask)) / (masked_std(mb_adv, mask) + 1e-8)
 
-                    mb_adv = advantages[step_idx, env_idx]
-                    if self.config.norm_adv:
-                        mb_adv = (mb_adv - masked_mean(mb_adv, mask)) / (masked_std(mb_adv, mask) + 1e-8)
+                        pg_loss1 = -mb_adv * ratio
+                        pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon)
+                        policy_loss = masked_mean(torch.maximum(pg_loss1, pg_loss2), mask)
 
-                    pg_loss1 = -mb_adv * ratio
-                    pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon)
-                    policy_loss = masked_mean(torch.maximum(pg_loss1, pg_loss2), mask)
+                        old_value = buffer.values[step_idx, env_idx]
+                        target = returns[step_idx, env_idx]
+                        new_value = new_value.float()
+                        if self.config.clip_vloss:
+                            unclipped = (new_value - target).square()
+                            clipped_value = old_value + (new_value - old_value).clamp(
+                                -self.config.vf_clip_epsilon,
+                                self.config.vf_clip_epsilon,
+                            )
+                            clipped = (clipped_value - target).square()
+                            value_loss = 0.5 * masked_mean(torch.maximum(unclipped, clipped), mask)
+                        else:
+                            value_loss = 0.5 * masked_mean((new_value - target).square(), mask)
 
-                    old_value = buffer.values[step_idx, env_idx]
-                    target = returns[step_idx, env_idx]
-                    new_value = new_value.float()
-                    if self.config.clip_vloss:
-                        unclipped = (new_value - target).square()
-                        clipped_value = old_value + (new_value - old_value).clamp(-self.config.vf_clip_epsilon, self.config.vf_clip_epsilon)
-                        clipped = (clipped_value - target).square()
-                        value_loss = 0.5 * masked_mean(torch.maximum(unclipped, clipped), mask)
+                        entropy_loss = masked_mean(entropy.float(), mask)
+                        loss = policy_loss - self.config.entropy_coeff * entropy_loss + self.config.value_coeff * value_loss
                     else:
-                        value_loss = 0.5 * masked_mean((new_value - target).square(), mask)
-
-                    entropy_loss = masked_mean(entropy.float(), mask)
-                    loss = policy_loss - self.config.entropy_coeff * entropy_loss + self.config.value_coeff * value_loss
+                        zero_terms = [param.sum() * 0.0 for param in self.policy.parameters() if param.requires_grad]
+                        loss = sum(zero_terms) if zero_terms else new_logprob.float().sum() * 0.0
 
                 self.optimizer.zero_grad(set_to_none=True)
                 with self.profiler.record("update.backward"):
@@ -311,16 +316,17 @@ class PPOTrainer:
                 with self.profiler.record("update.optimizer_step"):
                     self.optimizer.step()
 
-                with torch.no_grad():
-                    sample_kl = (ratio - 1.0) - logratio
-                    approx_kl_epoch = masked_mean(sample_kl, mask)
-                    clipfrac = masked_mean(((ratio - 1.0).abs() > self.config.clip_epsilon).float(), mask)
+                if has_valid:
+                    with torch.no_grad():
+                        sample_kl = (ratio - 1.0) - logratio
+                        approx_kl_epoch = masked_mean(sample_kl, mask)
+                        clipfrac = masked_mean(((ratio - 1.0).abs() > self.config.clip_epsilon).float(), mask)
 
-                metrics["policy_loss"].append(float(policy_loss.detach().cpu()))
-                metrics["value_loss"].append(float(value_loss.detach().cpu()))
-                metrics["entropy"].append(float(entropy_loss.detach().cpu()))
-                metrics["approx_kl"].append(float(approx_kl_epoch.detach().cpu()))
-                metrics["clipfrac"].append(float(clipfrac.detach().cpu()))
+                    metrics["policy_loss"].append(float(policy_loss.detach().cpu()))
+                    metrics["value_loss"].append(float(value_loss.detach().cpu()))
+                    metrics["entropy"].append(float(entropy_loss.detach().cpu()))
+                    metrics["approx_kl"].append(float(approx_kl_epoch.detach().cpu()))
+                    metrics["clipfrac"].append(float(clipfrac.detach().cpu()))
 
             if self.config.target_kl is not None and float(approx_kl_epoch.detach().cpu()) > self.config.target_kl:
                 break

@@ -9,7 +9,9 @@ from anon_tokyo.data.transforms import simulation_transform
 from anon_tokyo.simulation.dynamics import JerkPncConfig, JerkPncModel
 from anon_tokyo.simulation.env import ClosedLoopEnv, ClosedLoopEnvConfig
 from anon_tokyo.simulation.agent_centric.model import AgentCentricModel
+from anon_tokyo.simulation.anon_tokyo.model import AnonTokyoModel
 from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer
+from anon_tokyo.simulation.query_centric.model import QueryCentricModel
 from anon_tokyo.simulation.rewards import RewardConfig, compute_rewards
 
 
@@ -274,6 +276,32 @@ def test_agent_centric_encoder_uses_nearest_local_context() -> None:
     torch.testing.assert_close(encoded["context_map_indices"][0, 0], torch.arange(128))
 
 
+def test_query_centric_and_anon_tokyo_policy_forward_shapes() -> None:
+    batch = _batch(max_agents=4)
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=4))
+    obs = env.reset(batch)
+    target_mask = obs["controlled_mask"].bool() & obs["agent_mask"].bool()
+
+    for policy in (
+        QueryCentricModel(d_model=32, num_layers=1, num_heads=4, sparse_k=4),
+        AnonTokyoModel(d_model=32, num_layers=1, num_heads=4, sparse_k=4),
+    ):
+        encoded = policy.encoder(obs)
+        assert torch.equal(encoded["ego_mask"], target_mask)
+        assert encoded["ego_feature"][~target_mask].abs().sum() == 0
+
+        action, logprob, entropy, value = policy(obs, sampling_method="mean")
+
+        assert action.shape == (1, 4, 2)
+        assert logprob.shape == (1, 4)
+        assert entropy.shape == (1, 4)
+        assert value.shape == (1, 4)
+        assert torch.all(action[..., 0] >= -5.0)
+        assert torch.all(action[..., 0] <= 3.0)
+        assert torch.all(action[..., 1] >= -1.0)
+        assert torch.all(action[..., 1] <= 1.0)
+
+
 class TinyPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -303,3 +331,23 @@ def test_ppo_one_update_with_tiny_policy() -> None:
     metrics = trainer.train_one_update(batch)
     assert metrics["value_loss"] >= 0
     assert any(not torch.allclose(a, b) for a, b in zip(before, policy.parameters()))
+
+
+def test_ppo_update_uses_map_tokens_without_raw_map_geometry() -> None:
+    batch = _batch(max_agents=4)
+    centers = batch["map_polylines_center"]
+    B, M, _ = centers.shape
+    token_features = torch.zeros(B, M, 11, dtype=centers.dtype)
+    token_features[..., 0:2] = centers
+    token_features[..., 2:4] = centers
+    token_features[..., 4:6] = centers
+    token_features[..., 6] = 1.0
+    batch["map_token_features"] = token_features
+
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=1, history_steps=4))
+    policy = AnonTokyoModel(d_model=32, num_layers=1, num_heads=4, sparse_k=4)
+    trainer = PPOTrainer(env, policy, config=PPOConfig(num_steps=1, optimization_epochs=1, minibatch_size=1))
+
+    metrics = trainer.train_one_update(batch, sampling_method="mean")
+
+    assert metrics["value_loss"] >= 0

@@ -128,8 +128,8 @@ class WebVisualizerService:
         return {
             "prediction_configs": self._list_files("configs/prediction", {".yaml", ".yml"}),
             "simulation_configs": self._list_files("configs/simulation", {".yaml", ".yml"}),
-            "checkpoints": self._list_files("checkpoints", {".ckpt", ".pt", ".pth"})
-            + self._list_files("tb_logs", {".ckpt", ".pt", ".pth"}, limit=1000),
+            "checkpoints": self._list_files("checkpoints", {".ckpt", ".pt", ".pth"}, limit=None)
+            + self._list_files("tb_logs", {".ckpt", ".pt", ".pth"}, limit=None),
             "splits": list(SPLITS),
         }
 
@@ -176,13 +176,13 @@ class WebVisualizerService:
             raise ValueError(f"simulation_control_mode must be one of {SIMULATION_CONTROL_MODES}, got {mode!r}")
         return mode
 
-    def _list_files(self, root: str, suffixes: set[str], limit: int = 300) -> list[str]:
+    def _list_files(self, root: str, suffixes: set[str], limit: int | None = 300) -> list[str]:
         root_path = Path(root)
         if not root_path.exists():
             return []
         files = [str(path) for path in root_path.rglob("*") if path.is_file() and path.suffix in suffixes]
         files.sort(key=lambda item: Path(item).stat().st_mtime, reverse=True)
-        return files[:limit]
+        return files if limit is None else files[:limit]
 
     def _base_data_cfg(self) -> tuple[dict[str, Any], str]:
         data_cfg = dict(self.cfg.get("data") or {})
