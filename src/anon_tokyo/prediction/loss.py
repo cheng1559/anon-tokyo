@@ -111,6 +111,7 @@ def _dense_future_loss_query(
     pred_dense: Tensor,
     gt_future: Tensor,
     gt_mask: Tensor,
+    sample_weight: Tensor | None = None,
 ) -> Tensor:
     """Dense future prediction loss for query-centric models.
 
@@ -136,6 +137,9 @@ def _dense_future_loss_query(
     loss_per_agent = vel_l1 + reg_loss
     agent_valid = gt_mask.sum(dim=-1) > 0
     loss_per_sample = (loss_per_agent * agent_valid.float()).sum(dim=-1) / agent_valid.sum(dim=-1).clamp(min=1)
+    if sample_weight is not None:
+        weight = sample_weight.to(dtype=loss_per_sample.dtype, device=loss_per_sample.device)
+        return (loss_per_sample * weight).sum() / weight.sum().clamp(min=1)
     return loss_per_sample.mean()
 
 
@@ -261,8 +265,13 @@ def prediction_loss(
         masked_vel = vel_i * agent_valid
         masked_cls = cls_i * agent_valid
 
-        per_agent = w_reg * masked_reg + w_vel * masked_vel + w_cls * masked_cls
-        layer_loss = per_agent.sum() / valid_count
+        # Match the current MTR aggregation format: reg/vel are averaged over
+        # valid centers, while cls contributes as the summed target CE.
+        layer_loss = (
+            w_reg * masked_reg.sum() / valid_count
+            + w_vel * masked_vel.sum() / valid_count
+            + w_cls * masked_cls.sum()
+        )
         total_decoder_loss = total_decoder_loss + layer_loss
 
         loss_dict[f"loss/layer{i}"] = layer_loss.detach()
@@ -291,14 +300,26 @@ def prediction_loss(
     # Dense future prediction auxiliary loss
     if "pred_dense_trajs" in output:
         pred_dense = output["pred_dense_trajs"]
-        if pred_dense.ndim == 5:
-            pred_dense = pred_dense[:, 0]
         dense_gt_future = batch["obj_trajs_future"] if "obj_trajs_future" in batch else batch["obj_trajs_future_local"]
-        dense_loss = _dense_future_loss_query(
-            pred_dense,
-            dense_gt_future,
-            batch["obj_trajs_future_mask"],
-        )
+        if pred_dense.ndim == 5:
+            dense_valid = agent_valid.bool().reshape(B * K)
+            pred_dense_flat = pred_dense[:, :K].reshape(B * K, *pred_dense.shape[2:])[dense_valid]
+            dense_gt = dense_gt_future[:, None].expand(B, K, *dense_gt_future.shape[1:])
+            dense_mask = batch["obj_trajs_future_mask"][:, None].expand(
+                B, K, *batch["obj_trajs_future_mask"].shape[1:]
+            )
+            dense_loss = _dense_future_loss_query(
+                pred_dense_flat,
+                dense_gt.reshape(B * K, *dense_gt.shape[2:])[dense_valid],
+                dense_mask.reshape(B * K, *dense_mask.shape[2:])[dense_valid],
+            )
+        else:
+            dense_loss = _dense_future_loss_query(
+                pred_dense,
+                dense_gt_future,
+                batch["obj_trajs_future_mask"],
+                sample_weight=agent_valid.sum(dim=-1),
+            )
         total_loss = total_loss + dense_loss
         loss_dict["loss/dense"] = dense_loss.detach()
 
