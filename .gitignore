@@ -43,3 +43,6 @@ Thumbs.db
 reference-code
 assets/paper
 assets/refs
+
+# Local project memory
+PROJECT_MEMORY.md
