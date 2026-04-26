@@ -4,7 +4,9 @@ import 'vue-sonner/style.css'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useColorMode } from '@vueuse/core'
+import type { ChartData } from 'chart.js'
 import { toast } from 'vue-sonner'
+import AgentSeriesChart from '@/components/AgentSeriesChart.vue'
 import Card from '@/components/card/Card.vue'
 import CheckpointSelector from '@/components/checkpoint-selector/CheckpointSelector.vue'
 import Footer from '@/components/footer/Footer.vue'
@@ -20,8 +22,9 @@ import { Slider } from '@/components/ui/slider'
 import { Spinner } from '@/components/ui/spinner'
 import { Toaster } from '@/components/ui/sonner'
 import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { fetchBatch, fetchEnv, fetchFiles, initializeEnv } from '@/api/world'
-import type { Agent, BatchPayload, EnvInfo, FileCatalog } from '@/types/world'
+import type { Agent, BatchPayload, EnvInfo, FileCatalog, RolloutTrack } from '@/types/world'
 import { currentThemeId, setStoredThemeId, setThemeOptimized } from '@/utils/themeManager'
 import { THEMES } from '@/utils/themeRegistry'
 import { startThemeTransition } from '@/utils/themeTransition'
@@ -51,6 +54,7 @@ const showMap = ref(true)
 const showGroundTruth = ref(true)
 const showPredictions = ref(true)
 const selectedAgentId = ref<number | null>(null)
+const agentSignalTab = ref('reward')
 const isLoading = ref(false)
 const statusText = ref('Waiting for initialization...')
 let timer: number | undefined
@@ -98,16 +102,6 @@ const selectedRolloutTrack = computed(() => {
     if (agentId === null) return null
     return currentScenario.value?.rollout?.find((track) => track.agent_id === agentId) ?? null
 })
-const selectedGoalStatus = computed(() => {
-    const track = selectedRolloutTrack.value
-    if (!track?.goal) return null
-    const idx = Math.max(0, Math.min(frame.value, (track.goal_reached?.length ?? 1) - 1))
-    return {
-        reached: Boolean(track.goal_reached?.[idx]),
-        reachedFrame: track.goal_reached_frame,
-        goal: track.goal
-    }
-})
 const metadata = computed(() => {
     const scenario = currentScenario.value
     return {
@@ -118,6 +112,74 @@ const metadata = computed(() => {
     }
 })
 const formatRate = (value: number | undefined) => `${((value ?? 0) * 100).toFixed(1)}%`
+const formatSignalValue = (value: number | null) => (value === null ? '-' : value.toFixed(4))
+
+function flagAt(values: number[] | undefined, frameIdx: number, cumulative = false) {
+    if (!values?.length) return false
+    const idx = Math.max(0, Math.min(frameIdx, values.length - 1))
+    return cumulative ? values.slice(0, idx + 1).some(Boolean) : Boolean(values[idx])
+}
+
+function trackForAgent(agentId: number): RolloutTrack | undefined {
+    return currentScenario.value?.rollout?.find((track) => track.agent_id === agentId)
+}
+
+function agentState(agent: Agent): 'collision' | 'offroad' | 'goal' | 'controlled' | 'default' {
+    const track = trackForAgent(agent.id)
+    if (flagAt(track?.collision, frame.value)) return 'collision'
+    if (flagAt(track?.offroad, frame.value)) return 'offroad'
+    if (flagAt(track?.goal_reached, frame.value, true)) return 'goal'
+    if (track?.controlled) return 'controlled'
+    return 'default'
+}
+
+function agentStateColor(agent: Agent) {
+    const state = agentState(agent)
+    if (state === 'collision') return '#ef4444'
+    if (state === 'offroad') return '#f97316'
+    if (state === 'goal') return '#22c55e'
+    if (state === 'controlled') return '#3b82f6'
+    return '#64748b'
+}
+
+function cleanSeries(values: Array<number | null> | undefined) {
+    const series = values?.map((value) => (typeof value === 'number' && Number.isFinite(value) ? value : null)) ?? []
+    return series.some((value) => value !== null) ? series : null
+}
+
+function buildSeriesChartData(track: RolloutTrack | null, key: 'reward' | 'value', label: string, color: string): ChartData<'line'> | null {
+    const series = cleanSeries(track?.[key])
+    if (!series) return null
+    return {
+        labels: series.map((_, index) => String(index)),
+        datasets: [
+            {
+                label,
+                data: series,
+                borderColor: color,
+                backgroundColor: color,
+                fill: false,
+                tension: 0.15,
+                pointRadius: 0,
+                borderWidth: 2
+            }
+        ]
+    }
+}
+
+function seriesValueAt(values: Array<number | null> | undefined) {
+    if (!values?.length) return null
+    const idx = Math.max(0, Math.min(frame.value, values.length - 1))
+    const value = values[idx]
+    return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+const rewardChartData = computed(() => buildSeriesChartData(selectedRolloutTrack.value, 'reward', 'Reward', '#4A90E2'))
+const valueChartData = computed(() => buildSeriesChartData(selectedRolloutTrack.value, 'value', 'Value', '#F5A623'))
+const selectedSignalValues = computed(() => ({
+    reward: seriesValueAt(selectedRolloutTrack.value?.reward),
+    value: seriesValueAt(selectedRolloutTrack.value?.value)
+}))
 
 function logStatus(kind: 'INFO' | 'SUCCESS' | 'ERROR', message: string) {
     statusText.value = `${statusText.value}\n[${kind}]     ${message}`.trimStart()
@@ -649,18 +711,6 @@ onBeforeUnmount(() => {
                                         <div class="font-semibold">{{ selectedTrackCounts.rollout }}</div>
                                     </div>
                                 </div>
-                                <div v-if="selectedGoalStatus" class="rounded-md border p-2 text-sm">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <span class="text-muted-foreground">Goal Reached</span>
-                                        <Badge :variant="selectedGoalStatus.reached ? 'default' : 'secondary'">
-                                            {{ selectedGoalStatus.reached ? 'yes' : 'no' }}
-                                        </Badge>
-                                    </div>
-                                    <div class="text-muted-foreground mt-1 text-xs">
-                                        goal=({{ selectedGoalStatus.goal[0]?.toFixed(1) }}, {{ selectedGoalStatus.goal[1]?.toFixed(1) }})
-                                        <span v-if="selectedGoalStatus.reachedFrame !== null"> frame={{ selectedGoalStatus.reachedFrame }}</span>
-                                    </div>
-                                </div>
                                 <div class="scrollbar-thin max-h-64 space-y-1 overflow-y-auto pr-1">
                                     <Button
                                         v-for="agent in sortedAgents"
@@ -670,16 +720,8 @@ onBeforeUnmount(() => {
                                         @click="selectedAgentId = agent.id"
                                     >
                                         <span
-                                            class="size-2.5 shrink-0 rounded-full"
-                                            :class="
-                                                agent.target
-                                                    ? 'bg-[#22c55e]'
-                                                    : agent.controlled
-                                                      ? 'bg-[#3b82f6]'
-                                                      : agent.sdc
-                                                        ? 'bg-[#f59e0b]'
-                                                        : 'bg-[#64748b]'
-                                            "
+                                            class="size-2.5 shrink-0 rounded-full ring-1 ring-black/15 ring-inset"
+                                            :style="{ backgroundColor: agentStateColor(agent) }"
                                         />
                                         <span class="w-8 text-left text-xs tabular-nums">#{{ agent.id }}</span>
                                         <span class="truncate">{{ agent.type }}</span>
@@ -688,6 +730,42 @@ onBeforeUnmount(() => {
                                         <Badge v-else-if="agent.sdc" class="ml-auto" variant="secondary">sdc</Badge>
                                     </Button>
                                 </div>
+                            </Card>
+
+                            <Card icon="lucide:chart-line" title="Agent Signals">
+                                <div class="flex items-center justify-between gap-2 text-sm">
+                                    <div class="min-w-0">
+                                        <div class="font-medium">
+                                            {{ selectedAgent ? `Agent #${selectedAgent.id}` : 'All agents' }}
+                                        </div>
+                                        <div class="text-muted-foreground text-xs">
+                                            {{ selectedRolloutTrack?.controlled ? 'controlled rollout' : 'rollout series' }}
+                                        </div>
+                                    </div>
+                                    <div class="grid shrink-0 grid-cols-2 gap-2 text-xs">
+                                        <div class="rounded-md border px-2 py-1">
+                                            <div class="text-muted-foreground">Reward</div>
+                                            <div class="font-mono font-semibold">{{ formatSignalValue(selectedSignalValues.reward) }}</div>
+                                        </div>
+                                        <div class="rounded-md border px-2 py-1">
+                                            <div class="text-muted-foreground">Value</div>
+                                            <div class="font-mono font-semibold">{{ formatSignalValue(selectedSignalValues.value) }}</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <Tabs v-model="agentSignalTab" class="gap-3">
+                                    <TabsList class="grid w-full grid-cols-2">
+                                        <TabsTrigger class="cursor-pointer text-xs" value="reward">Reward</TabsTrigger>
+                                        <TabsTrigger class="cursor-pointer text-xs" value="value">Value</TabsTrigger>
+                                    </TabsList>
+                                    <TabsContent class="mt-0" value="reward">
+                                        <AgentSeriesChart :chart-data="rewardChartData" empty-text="No reward data" :frame-idx="frame" />
+                                    </TabsContent>
+                                    <TabsContent class="mt-0" value="value">
+                                        <AgentSeriesChart :chart-data="valueChartData" empty-text="No value data" :frame-idx="frame" />
+                                    </TabsContent>
+                                </Tabs>
                             </Card>
 
                             <Card icon="lucide:palette" title="Legend">

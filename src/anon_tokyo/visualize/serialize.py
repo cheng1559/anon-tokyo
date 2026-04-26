@@ -31,6 +31,30 @@ def _pad_event_frames(events: Tensor, num_frames: int) -> Tensor:
     return torch.cat((pad, events), dim=0)
 
 
+def _pad_series_frames(values: Tensor, num_frames: int) -> Tensor:
+    """Pad ``[T, A]`` scalar series with NaNs for non-simulated history frames."""
+    if values.shape[0] >= num_frames:
+        return values[-num_frames:]
+    pad = torch.full((num_frames - values.shape[0], values.shape[1]), float("nan"), dtype=values.dtype, device=values.device)
+    return torch.cat((pad, values), dim=0)
+
+
+def _pad_current_frame_series(values: Tensor, num_frames: int) -> Tensor:
+    """Pad ``[T, A]`` state series so the first value lands on the current frame."""
+    if values.shape[0] >= num_frames:
+        return values[-num_frames:]
+    pad_before = max(num_frames - values.shape[0] - 1, 0)
+    pad_after = num_frames - values.shape[0] - pad_before
+    before = torch.full((pad_before, values.shape[1]), float("nan"), dtype=values.dtype, device=values.device)
+    after = torch.full((pad_after, values.shape[1]), float("nan"), dtype=values.dtype, device=values.device)
+    return torch.cat((before, values, after), dim=0)
+
+
+def _as_optional_list(value: Tensor, digits: int = 4) -> list[float | None]:
+    flat = _cpu(value.float()).reshape(-1)
+    return [round(float(item.item()), digits) if bool(torch.isfinite(item)) else None for item in flat]
+
+
 def _valid_lines(polylines: Tensor, mask: Tensor, max_lines: int | None = None) -> list[dict[str, Any]]:
     lines = []
     valid = mask.bool()
@@ -297,6 +321,7 @@ def serialize_simulation_batch(
     rollout_headings: Tensor | None = None,
     rollout_valid: Tensor | None = None,
     rollout_events: dict[str, Tensor] | None = None,
+    rollout_series: dict[str, Tensor] | None = None,
     goal_reaching_threshold: float = 1.5,
     max_map_lines: int | None = None,
 ) -> dict[str, Any]:
@@ -335,6 +360,16 @@ def serialize_simulation_batch(
                 if rollout_events is not None
                 else None
             )
+            reward_series = (
+                _pad_series_frames(_cpu(rollout_series["reward"][:, sample_idx]).float(), num_frames).permute(1, 0)
+                if rollout_series is not None and "reward" in rollout_series
+                else None
+            )
+            value_series = (
+                _pad_current_frame_series(_cpu(rollout_series["value"][:, sample_idx]).float(), num_frames).permute(1, 0)
+                if rollout_series is not None and "value" in rollout_series
+                else None
+            )
             tracks = []
             agent_mask = _cpu(batch.get("agent_mask", torch.ones(positions.shape[0]))[sample_idx]).bool()
             controlled = _cpu(batch.get("controlled_mask", torch.zeros(positions.shape[0]))[sample_idx]).bool()
@@ -355,6 +390,10 @@ def serialize_simulation_batch(
                 }
                 if headings is not None:
                     record["headings"] = _as_list(headings[agent_idx, keep], digits=4)
+                if reward_series is not None:
+                    record["reward"] = _as_optional_list(reward_series[agent_idx, keep])
+                if value_series is not None:
+                    record["value"] = _as_optional_list(value_series[agent_idx, keep])
                 if goal_pos is not None and bool(controlled[agent_idx].item()):
                     goal = goal_pos[agent_idx]
                     reached = (

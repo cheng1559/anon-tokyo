@@ -30,6 +30,7 @@ const panY = ref(0)
 const dragging = ref(false)
 const lastX = ref(0)
 const lastY = ref(0)
+let resizeObserver: ResizeObserver | undefined
 
 type Theme = ReturnType<typeof getTheme>
 
@@ -91,8 +92,10 @@ function resize() {
   if (!canvas) return
   const rect = canvas.getBoundingClientRect()
   const dpr = window.devicePixelRatio || 1
-  canvas.width = Math.max(1, Math.floor(rect.width * dpr))
-  canvas.height = Math.max(1, Math.floor(rect.height * dpr))
+  const width = Math.max(1, Math.floor(rect.width * dpr))
+  const height = Math.max(1, Math.floor(rect.height * dpr))
+  if (canvas.width !== width) canvas.width = width
+  if (canvas.height !== height) canvas.height = height
   const ctx = context()
   ctx?.setTransform(dpr, 0, 0, dpr, 0, 0)
   draw()
@@ -490,6 +493,10 @@ onMounted(() => {
   window.addEventListener('resize', resize)
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mouseup', onMouseUp)
+  if (canvasRef.value) {
+    resizeObserver = new ResizeObserver(() => resize())
+    resizeObserver.observe(canvasRef.value)
+  }
   resize()
 })
 
@@ -497,6 +504,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
   window.removeEventListener('mousemove', onMouseMove)
   window.removeEventListener('mouseup', onMouseUp)
+  resizeObserver?.disconnect()
+  resizeObserver = undefined
 })
 
 defineExpose({ resetView, resize, zoomIn, zoomOut })

@@ -36,6 +36,8 @@ export interface RolloutTrack {
   valid?: number[]
   collision?: number[]
   offroad?: number[]
+  reward?: Array<number | null>
+  value?: Array<number | null>
   goal?: number[]
   goal_reached?: number[]
   goal_reached_frame?: number | null
