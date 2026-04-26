@@ -11,7 +11,13 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",
     "shapely>=2.0",
+    "tqdm>=4.66",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
+
+[project.scripts]
+anon-tokyo-visualizer = "anon_tokyo.apps.web_visualizer:main"
 
 [tool.uv]
 # Driver 535 supports CUDA 12.8; use PyTorch cu128 wheels

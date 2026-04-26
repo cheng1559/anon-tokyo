@@ -10,6 +10,13 @@ build/
 .venv*/
 uv.lock
 
+# Frontend
+node_modules/
+.vite/
+*.tsbuildinfo
+src/anon_tokyo/visualize/web/frontend/node_modules/
+src/anon_tokyo/visualize/web/frontend/dist/
+
 # Data
 data/raw
 data/processed

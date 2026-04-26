@@ -192,6 +192,7 @@ class ClosedLoopEnv:
         next_index = self.start_index + self.step_count + 1
         latest_valid = self.valid[:, :, -1]
         active = self.controlled_mask & latest_valid & ~self.done
+        terminal_controlled = self.controlled_mask & self.done
 
         dyn = self.dynamics.step(
             self.positions[:, :, -1],
@@ -213,14 +214,23 @@ class ClosedLoopEnv:
         log_yaw_rate = self.log_kinematics["yaw_rate"][:, :, next_index]
 
         active_e = active.unsqueeze(-1)
-        next_pos = torch.where(active_e, dyn["positions"], log_pos)
-        next_vel = torch.where(active_e, dyn["velocities"], log_vel)
-        next_heading = torch.where(active, dyn["headings"], log_heading)
-        next_size = torch.where(active_e, self.sizes[:, :, -1], log_size)
-        next_valid = torch.where(active, latest_valid, log_valid)
-        next_a_long = torch.where(active, dyn["a_long"], log_a_long)
-        next_a_lat = torch.where(active, dyn["a_lat"], log_a_lat)
-        next_yaw_rate = torch.where(active, dyn["yaw_rate"], log_yaw_rate)
+        terminal_e = terminal_controlled.unsqueeze(-1)
+        prev_pos = self.positions[:, :, -1]
+        prev_vel = self.velocities[:, :, -1]
+        prev_heading = self.headings[:, :, -1]
+        prev_size = self.sizes[:, :, -1]
+        prev_a_long = self.a_long[:, :, -1]
+        prev_a_lat = self.a_lat[:, :, -1]
+        prev_yaw_rate = self.yaw_rate[:, :, -1]
+
+        next_pos = torch.where(active_e, dyn["positions"], torch.where(terminal_e, prev_pos, log_pos))
+        next_vel = torch.where(active_e, dyn["velocities"], torch.where(terminal_e, prev_vel, log_vel))
+        next_heading = torch.where(active, dyn["headings"], torch.where(terminal_controlled, prev_heading, log_heading))
+        next_size = torch.where(active_e, self.sizes[:, :, -1], torch.where(terminal_e, prev_size, log_size))
+        next_valid = torch.where(self.controlled_mask, active, log_valid)
+        next_a_long = torch.where(active, dyn["a_long"], torch.where(terminal_controlled, prev_a_long, log_a_long))
+        next_a_lat = torch.where(active, dyn["a_lat"], torch.where(terminal_controlled, prev_a_lat, log_a_lat))
+        next_yaw_rate = torch.where(active, dyn["yaw_rate"], torch.where(terminal_controlled, prev_yaw_rate, log_yaw_rate))
         next_jerk_long = torch.where(active, dyn["jerk_long"], torch.zeros_like(log_a_long))
         next_jerk_lat = torch.where(active, dyn["jerk_lat"], torch.zeros_like(log_a_lat))
 

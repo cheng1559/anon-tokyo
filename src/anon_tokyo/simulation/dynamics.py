@@ -3,14 +3,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor
+
+PNC_LATERAL = (
+    -221.76124992,
+    -1.0,
+    32.47684285,
+    97.76347776,
+    -9.81,
+    18.16816182,
+    0.0,
+    -277.88361484,
+    83.73152838,
+    0.0,
+)
+MIN_DYNAMIC_SPEED = 1.5
+EPS = 1e-6
+MIN_STEERING_ANGLE = math.radians(-432.0) / 12.6
+MAX_STEERING_ANGLE = math.radians(432.0) / 12.6
 
 
 def wrap_angle(angle: Tensor) -> Tensor:
     """Wrap radians to [-pi, pi]."""
     return (angle + torch.pi) % (2.0 * torch.pi) - torch.pi
+
+
+def get_wheelbase_from_length(length: Tensor) -> Tensor:
+    """Estimate wheelbase from vehicle length using the Hermes convention."""
+    return (length * 3.0 / 4.995).clamp(min=1.5)
+
+
+def velocity_body_frame_components(velocities: Tensor, headings: Tensor) -> tuple[Tensor, Tensor]:
+    """Return longitudinal and lateral velocity in the heading-aligned body frame."""
+    forward = torch.stack((headings.cos(), headings.sin()), dim=-1)
+    left = torch.stack((-headings.sin(), headings.cos()), dim=-1)
+    return (velocities * forward).sum(dim=-1), (velocities * left).sum(dim=-1)
+
+
+def _stabilize_tensor(value: Tensor, eps: float) -> Tensor:
+    abs_value = value.abs()
+    sign = torch.sign(value)
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    return torch.where(abs_value < eps, sign * eps, value)
 
 
 @dataclass
@@ -27,6 +64,13 @@ class JerkPncConfig:
     min_speed: float = 0.0
     max_speed: float = 40.0
     lateral_speed_floor: float = 1.0
+    min_steering_angle: float = MIN_STEERING_ANGLE
+    max_steering_angle: float = MAX_STEERING_ANGLE
+    max_tire_angle_rate_lower_bound: float = 0.03
+    max_tire_angle_rate_upper_bound: float = 0.3 * 0.7
+    max_tire_angle_rate_gain: float = 1.39 * 0.7
+    curvature_speed_floor: float = 1.0
+    min_dynamic_speed: float = MIN_DYNAMIC_SPEED
 
 
 class JerkPncModel:
@@ -49,13 +93,45 @@ class JerkPncModel:
         cfg = self.config
         return torch.tensor([cfg.max_jerk_long, cfg.max_jerk_lat], dtype=torch.float32)
 
+    def _delta_steering_rate_bound(self, speed: Tensor) -> Tensor:
+        cfg = self.config
+        speed = speed.clamp_min(1e-3)
+        return (cfg.max_tire_angle_rate_gain / speed).clamp(
+            min=cfg.max_tire_angle_rate_lower_bound,
+            max=cfg.max_tire_angle_rate_upper_bound,
+        )
+
+    @staticmethod
+    def _dynamic_lateral_update(
+        dt: float,
+        v_long: Tensor,
+        v_lat: Tensor,
+        yaw_rate: Tensor,
+        steering: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        params = torch.as_tensor(PNC_LATERAL, dtype=v_long.dtype, device=v_long.device)
+        v_long_used = _stabilize_tensor(v_long, MIN_DYNAMIC_SPEED * 0.9)
+
+        a = _stabilize_tensor(params[0] / v_long_used, EPS)
+        p = (params[1] * v_long_used + params[2] / v_long_used) * yaw_rate + params[3] * steering
+        exp_a = torch.exp(a * dt)
+        next_v_lat = exp_a * v_lat + (exp_a - 1.0) * p / a
+
+        b = _stabilize_tensor(params[6] * v_long_used + params[7] / v_long_used, EPS)
+        q = params[5] / v_long_used * v_lat + params[8] * steering
+        exp_b = torch.exp(b * dt)
+        next_yaw_rate = exp_b * yaw_rate + (exp_b - 1.0) * q / b
+        return next_v_lat, next_yaw_rate
+
     def step(
         self,
         positions: Tensor,
         velocities: Tensor,
         headings: Tensor,
+        sizes: Tensor,
         a_long: Tensor,
         a_lat: Tensor,
+        steering: Tensor,
         yaw_rate: Tensor,
         actions: Tensor,
     ) -> dict[str, Tensor]:
@@ -66,19 +142,38 @@ class JerkPncModel:
         jerk_long = actions[..., 0].clamp(cfg.min_jerk_long, cfg.max_jerk_long)
         jerk_lat = actions[..., 1].clamp(cfg.min_jerk_lat, cfg.max_jerk_lat)
 
-        heading_dir = torch.stack((headings.cos(), headings.sin()), dim=-1)
-        v_long = (velocities * heading_dir).sum(dim=-1).clamp_min(cfg.min_speed)
+        v_long, v_lat = velocity_body_frame_components(velocities, headings)
+        speed = velocities.norm(dim=-1)
+        wheelbase = get_wheelbase_from_length(sizes[..., 0])
 
         next_a_long = (a_long + jerk_long * dt).clamp(cfg.min_a_long, cfg.max_a_long)
-        next_a_lat = (a_lat + jerk_lat * dt).clamp(cfg.min_a_lat, cfg.max_a_lat)
-
         next_v_long = (v_long + 0.5 * (a_long + next_a_long) * dt).clamp(cfg.min_speed, cfg.max_speed)
-        next_yaw_rate = next_a_lat / next_v_long.clamp_min(cfg.lateral_speed_floor)
+
+        current_curvature = torch.tan(steering) / wheelbase
+        current_a_lat = v_long.square() * current_curvature
+        target_a_lat = (current_a_lat + jerk_lat * dt).clamp(cfg.min_a_lat, cfg.max_a_lat)
+        target_curvature = target_a_lat / next_v_long.square().clamp_min(cfg.curvature_speed_floor)
+        target_steering = torch.atan(target_curvature * wheelbase)
+
+        delta_bound = self._delta_steering_rate_bound(speed) * dt
+        delta_steering = (target_steering - steering).clamp(-delta_bound, delta_bound)
+        next_steering = (steering + delta_steering).clamp(cfg.min_steering_angle, cfg.max_steering_angle)
+
+        next_curvature = torch.tan(next_steering) / wheelbase
+        mean_v_long = 0.5 * (v_long + next_v_long)
+        kinematic_yaw_rate = mean_v_long * next_curvature
+        kinematic_v_lat = kinematic_yaw_rate * wheelbase * 0.5
+        dynamic_v_lat, dynamic_yaw_rate = self._dynamic_lateral_update(dt, v_long, v_lat, yaw_rate, next_steering)
+        use_dynamic = v_long > cfg.min_dynamic_speed
+        next_v_lat = torch.where(use_dynamic, dynamic_v_lat, kinematic_v_lat)
+        next_yaw_rate = torch.where(use_dynamic, dynamic_yaw_rate, kinematic_yaw_rate)
         next_headings = wrap_angle(headings + 0.5 * (yaw_rate + next_yaw_rate) * dt)
 
-        next_heading_dir = torch.stack((next_headings.cos(), next_headings.sin()), dim=-1)
-        next_velocities = next_v_long.unsqueeze(-1) * next_heading_dir
+        next_vx = next_v_long * next_headings.cos() - next_v_lat * next_headings.sin()
+        next_vy = next_v_long * next_headings.sin() + next_v_lat * next_headings.cos()
+        next_velocities = torch.stack((next_vx, next_vy), dim=-1)
         next_positions = positions + 0.5 * (velocities + next_velocities) * dt
+        next_a_lat = next_v_long.square() * next_curvature
 
         return {
             "positions": next_positions,
@@ -86,6 +181,7 @@ class JerkPncModel:
             "headings": next_headings,
             "a_long": next_a_long,
             "a_lat": next_a_lat,
+            "steering": next_steering,
             "yaw_rate": next_yaw_rate,
             "jerk_long": jerk_long,
             "jerk_lat": jerk_lat,
@@ -129,7 +225,10 @@ def infer_log_kinematics(log_trajs: Tensor, timestamps: Tensor | None = None, de
     zeros = torch.zeros_like(v_long[..., :1])
     a_long = torch.cat((zeros, a_long_delta), dim=-1)
     yaw_rate = torch.cat((zeros, yaw_rate_delta), dim=-1)
-    a_lat = v_long.abs() * yaw_rate
+    wheelbase = get_wheelbase_from_length(log_trajs[..., 3])
+    curvature = torch.where(v_long.abs() > 1e-3, yaw_rate / _stabilize_tensor(v_long, 1e-3), torch.zeros_like(yaw_rate))
+    steering = torch.atan(curvature * wheelbase).clamp(MIN_STEERING_ANGLE, MAX_STEERING_ANGLE)
+    a_lat = v_long.square() * torch.tan(steering) / wheelbase
 
     return {
         "positions": positions,
@@ -137,5 +236,6 @@ def infer_log_kinematics(log_trajs: Tensor, timestamps: Tensor | None = None, de
         "headings": headings,
         "a_long": a_long,
         "a_lat": a_lat,
+        "steering": steering,
         "yaw_rate": yaw_rate,
     }

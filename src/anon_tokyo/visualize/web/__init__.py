@@ -1,0 +1,2 @@
+"""Static web visualizer assets."""
+
