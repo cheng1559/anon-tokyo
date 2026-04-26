@@ -239,12 +239,13 @@ class WebVisualizerService:
         if self.task == "prediction":
             predictions = self._predict(batch, inference_batch or batch)
             return serialize_prediction_batch(batch, predictions=predictions, max_map_lines=512)
-        rollout_positions, rollout_headings, rollout_valid, enriched_batch = self._simulate(batch)
+        rollout_positions, rollout_headings, rollout_valid, enriched_batch, rollout_events = self._simulate(batch)
         return serialize_simulation_batch(
             enriched_batch,
             rollout_positions=rollout_positions,
             rollout_headings=rollout_headings,
             rollout_valid=rollout_valid,
+            rollout_events=rollout_events,
             goal_reaching_threshold=float(self.cfg.get("env", {}).get("rewards", {}).get("goal_reaching_threshold", 1.5)),
             max_map_lines=512,
         )
@@ -272,7 +273,7 @@ class WebVisualizerService:
     def _simulate(
         self,
         batch: dict[str, Any],
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict[str, Any]]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict[str, Any], dict[str, torch.Tensor] | None]:
         env_cfg = dict(self.cfg.get("env") or {})
         env_cfg["device"] = str(self.device)
         env = ClosedLoopEnv(ClosedLoopEnvConfig.from_dict(env_cfg))
@@ -282,11 +283,23 @@ class WebVisualizerService:
             assert env.log_kinematics is not None and env.log_mask is not None and env.batch is not None and env.goal_positions is not None
             enriched = dict(env.batch)
             enriched["goal_positions"] = env.goal_positions
-            return env.log_kinematics["positions"], env.log_kinematics["headings"], env.log_mask, enriched
+            return env.log_kinematics["positions"], env.log_kinematics["headings"], env.log_mask, enriched, None
+        collision_steps = []
+        offroad_steps = []
+        goal_reached_steps = []
         for _ in range(env.episode_steps):
             action, *_ = model(obs)
-            obs, _, _, _ = env.step(action)
+            obs, _, _, info = env.step(action)
+            assert env.goal_reached is not None
+            collision_steps.append(info["collision"].detach())
+            offroad_steps.append(info["offroad"].detach())
+            goal_reached_steps.append(env.goal_reached.detach())
         assert env.positions is not None and env.headings is not None and env.valid is not None and env.batch is not None and env.goal_positions is not None
         enriched = dict(env.batch)
         enriched["goal_positions"] = env.goal_positions
-        return env.positions, env.headings, env.valid, enriched
+        rollout_events = {
+            "collision": torch.stack(collision_steps, dim=0),
+            "offroad": torch.stack(offroad_steps, dim=0),
+            "goal_reached": torch.stack(goal_reached_steps, dim=0),
+        }
+        return env.positions, env.headings, env.valid, enriched, rollout_events

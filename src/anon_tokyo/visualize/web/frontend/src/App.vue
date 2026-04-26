@@ -117,6 +117,7 @@ const metadata = computed(() => {
         rollout: scenario?.rollout?.length ?? 0
     }
 })
+const formatRate = (value: number | undefined) => `${((value ?? 0) * 100).toFixed(1)}%`
 
 function logStatus(kind: 'INFO' | 'SUCCESS' | 'ERROR', message: string) {
     statusText.value = `${statusText.value}\n[${kind}]     ${message}`.trimStart()
@@ -560,6 +561,65 @@ onBeforeUnmount(() => {
                                 </div>
                             </Card>
 
+                            <Card v-if="batch?.metrics || currentScenario?.metrics" icon="lucide:activity" title="Rollout Metrics">
+                                <div class="space-y-3 text-sm">
+                                    <div v-if="batch?.metrics" class="space-y-1.5">
+                                        <div class="text-muted-foreground text-xs font-semibold tracking-wide uppercase">Batch</div>
+                                        <div class="grid grid-cols-2 gap-2">
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Collision</div>
+                                                <div class="font-semibold">{{ formatRate(batch.metrics.collision_rate) }}</div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Offroad</div>
+                                                <div class="font-semibold">{{ formatRate(batch.metrics.offroad_rate) }}</div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Goal</div>
+                                                <div class="font-semibold">{{ formatRate(batch.metrics.goal_reaching_rate) }}</div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Done</div>
+                                                <div class="font-semibold">{{ formatRate(batch.metrics.done_rate) }}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div v-if="currentScenario?.metrics" class="space-y-1.5">
+                                        <div class="text-muted-foreground text-xs font-semibold tracking-wide uppercase">World</div>
+                                        <div class="grid grid-cols-2 gap-2">
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Collision</div>
+                                                <div class="font-semibold">
+                                                    {{ formatRate(currentScenario.metrics.collision_rate) }}
+                                                    <span class="text-muted-foreground text-xs">({{ currentScenario.metrics.collision_count }}/{{ currentScenario.metrics.controlled_count }})</span>
+                                                </div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Offroad</div>
+                                                <div class="font-semibold">
+                                                    {{ formatRate(currentScenario.metrics.offroad_rate) }}
+                                                    <span class="text-muted-foreground text-xs">({{ currentScenario.metrics.offroad_count }}/{{ currentScenario.metrics.controlled_count }})</span>
+                                                </div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Goal</div>
+                                                <div class="font-semibold">
+                                                    {{ formatRate(currentScenario.metrics.goal_reaching_rate) }}
+                                                    <span class="text-muted-foreground text-xs">({{ currentScenario.metrics.goal_reached_count }}/{{ currentScenario.metrics.controlled_count }})</span>
+                                                </div>
+                                            </div>
+                                            <div class="rounded-md border p-2">
+                                                <div class="text-muted-foreground text-xs">Done</div>
+                                                <div class="font-semibold">
+                                                    {{ formatRate(currentScenario.metrics.done_rate) }}
+                                                    <span class="text-muted-foreground text-xs">({{ currentScenario.metrics.done_count }}/{{ currentScenario.metrics.controlled_count }})</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Card>
+
                             <Card icon="lucide:mouse-pointer-2" title="Agent Selection">
                                 <div>
                                     <Label class="text-muted-foreground mb-1.5 block text-sm font-medium">Visible Trajectories</Label>
@@ -647,6 +707,14 @@ onBeforeUnmount(() => {
                                     <div class="text-muted-foreground flex items-center gap-2 text-sm">
                                         <div class="h-4 w-4 shrink-0 rounded-full bg-[#64748b] shadow-sm" />
                                         <Label>NPC Agent</Label>
+                                    </div>
+                                    <div class="text-muted-foreground flex items-center gap-2 text-sm">
+                                        <div class="h-4 w-4 shrink-0 rounded-full bg-[#f97316] shadow-sm" />
+                                        <Label>Offroad</Label>
+                                    </div>
+                                    <div class="text-muted-foreground flex items-center gap-2 text-sm">
+                                        <div class="h-4 w-4 shrink-0 rounded-full bg-[#ef4444] shadow-sm" />
+                                        <Label>Collision</Label>
                                     </div>
                                     <div class="mt-4 border-t pt-3">
                                         <p class="text-muted-foreground mb-1 text-xs font-semibold tracking-wide uppercase">Map</p>

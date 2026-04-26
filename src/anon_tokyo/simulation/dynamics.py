@@ -50,6 +50,27 @@ def _stabilize_tensor(value: Tensor, eps: float) -> Tensor:
     return torch.where(abs_value < eps, sign * eps, value)
 
 
+def _apply_jerk_and_clamp_acceleration(
+    current_acceleration: Tensor,
+    jerk: Tensor,
+    dt: float,
+    min_acceleration: float,
+    max_acceleration: float,
+    *,
+    positive_jerk_limit_when_negative_acc: float | None = None,
+    positive_jerk_limit_when_nonnegative_acc: float | None = None,
+) -> Tensor:
+    effective_jerk = jerk
+    if positive_jerk_limit_when_negative_acc is not None and positive_jerk_limit_when_nonnegative_acc is not None:
+        positive_limit = torch.where(
+            current_acceleration < 0,
+            torch.full_like(jerk, positive_jerk_limit_when_negative_acc),
+            torch.full_like(jerk, positive_jerk_limit_when_nonnegative_acc),
+        )
+        effective_jerk = torch.where(jerk > 0, torch.minimum(jerk, positive_limit), jerk)
+    return (current_acceleration + effective_jerk * dt).clamp(min_acceleration, max_acceleration)
+
+
 @dataclass
 class JerkPncConfig:
     dt: float = 0.1
@@ -71,6 +92,8 @@ class JerkPncConfig:
     max_tire_angle_rate_gain: float = 1.39 * 0.7
     curvature_speed_floor: float = 1.0
     min_dynamic_speed: float = MIN_DYNAMIC_SPEED
+    positive_jerk_limit_when_negative_acc: float | None = None
+    positive_jerk_limit_when_nonnegative_acc: float | None = 1.0
 
 
 class JerkPncModel:
@@ -146,7 +169,19 @@ class JerkPncModel:
         speed = velocities.norm(dim=-1)
         wheelbase = get_wheelbase_from_length(sizes[..., 0])
 
-        next_a_long = (a_long + jerk_long * dt).clamp(cfg.min_a_long, cfg.max_a_long)
+        next_a_long = _apply_jerk_and_clamp_acceleration(
+            a_long,
+            jerk_long,
+            dt,
+            cfg.min_a_long,
+            cfg.max_a_long,
+            positive_jerk_limit_when_negative_acc=(
+                cfg.max_jerk_long
+                if cfg.positive_jerk_limit_when_negative_acc is None
+                else cfg.positive_jerk_limit_when_negative_acc
+            ),
+            positive_jerk_limit_when_nonnegative_acc=cfg.positive_jerk_limit_when_nonnegative_acc,
+        )
         next_v_long = (v_long + 0.5 * (a_long + next_a_long) * dt).clamp(cfg.min_speed, cfg.max_speed)
 
         current_curvature = torch.tan(steering) / wheelbase

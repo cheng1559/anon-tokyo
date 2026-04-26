@@ -21,7 +21,7 @@ data:
   batch_size: 2048
   num_workers: 4
   max_agents: 64
-  max_polylines: 128
+  max_polylines: 768
   num_points_per_polyline: 20
   use_npz: true
   npz_root: data/processed

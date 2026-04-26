@@ -76,11 +76,41 @@ def test_jerk_pnc_longitudinal_and_lateral_actions() -> None:
     positions = torch.zeros(1, 1, 2)
     velocities = torch.tensor([[[1.0, 0.0]]])
     headings = torch.zeros(1, 1)
+    sizes = torch.tensor([[[4.5, 2.0]]])
     zeros = torch.zeros(1, 1)
-    out = model.step(positions, velocities, headings, zeros, zeros, zeros, torch.tensor([[[3.0, 1.0]]]))
+    out = model.step(positions, velocities, headings, sizes, zeros, zeros, zeros, zeros, torch.tensor([[[3.0, 1.0]]]))
     assert out["velocities"][0, 0, 0] > velocities[0, 0, 0]
     assert out["headings"][0, 0] > 0
+    assert out["steering"][0, 0] > 0
     assert out["jerk_lat"][0, 0] == 1.0
+
+
+def test_jerk_pnc_does_not_turn_in_place_from_lateral_jerk() -> None:
+    model = JerkPncModel(JerkPncConfig(dt=0.1, max_jerk_lat=1.0))
+    positions = torch.zeros(1, 1, 2)
+    velocities = torch.zeros(1, 1, 2)
+    headings = torch.zeros(1, 1)
+    sizes = torch.tensor([[[4.5, 2.0]]])
+    a_long = torch.zeros(1, 1)
+    a_lat = torch.zeros(1, 1)
+    steering = torch.zeros(1, 1)
+    yaw_rate = torch.zeros(1, 1)
+    action = torch.tensor([[[0.0, 1.0]]])
+
+    for _ in range(80):
+        out = model.step(positions, velocities, headings, sizes, a_long, a_lat, steering, yaw_rate, action)
+        positions = out["positions"]
+        velocities = out["velocities"]
+        headings = out["headings"]
+        a_long = out["a_long"]
+        a_lat = out["a_lat"]
+        steering = out["steering"]
+        yaw_rate = out["yaw_rate"]
+
+    torch.testing.assert_close(positions, torch.zeros_like(positions))
+    torch.testing.assert_close(velocities, torch.zeros_like(velocities))
+    torch.testing.assert_close(yaw_rate, torch.zeros_like(yaw_rate))
+    torch.testing.assert_close(headings, torch.zeros_like(headings))
 
 
 def test_env_controls_tracks_to_predict_and_replays_others() -> None:

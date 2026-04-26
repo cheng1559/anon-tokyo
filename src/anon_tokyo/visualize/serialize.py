@@ -7,6 +7,12 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from anon_tokyo.simulation.metrics import (
+    compute_rollout_metric_tensors,
+    serializable_batch_metrics,
+    serializable_world_metrics,
+)
+
 
 def _cpu(value: Tensor) -> Tensor:
     return value.detach().cpu()
@@ -15,6 +21,14 @@ def _cpu(value: Tensor) -> Tensor:
 def _as_list(value: Tensor, digits: int = 3) -> list:
     arr = _cpu(value.float()).numpy()
     return arr.round(digits).tolist()
+
+
+def _pad_event_frames(events: Tensor, num_frames: int) -> Tensor:
+    """Pad ``[T, A]`` event tensors to match rollout frames that include history."""
+    if events.shape[0] >= num_frames:
+        return events[-num_frames:]
+    pad = torch.zeros((num_frames - events.shape[0], events.shape[1]), dtype=events.dtype, device=events.device)
+    return torch.cat((pad, events), dim=0)
 
 
 def _valid_lines(polylines: Tensor, mask: Tensor, max_lines: int | None = None) -> list[dict[str, Any]]:
@@ -282,17 +296,45 @@ def serialize_simulation_batch(
     rollout_positions: Tensor | None = None,
     rollout_headings: Tensor | None = None,
     rollout_valid: Tensor | None = None,
+    rollout_events: dict[str, Tensor] | None = None,
     goal_reaching_threshold: float = 1.5,
     max_map_lines: int | None = None,
 ) -> dict[str, Any]:
     scenarios = []
     batch_size = int(batch["obj_trajs"].shape[0])
+    rollout_metric_tensors = None
+    if rollout_events is not None:
+        rollout_metric_tensors = compute_rollout_metric_tensors(
+            collision=rollout_events["collision"],
+            offroad=rollout_events["offroad"],
+            goal_reached=rollout_events["goal_reached"],
+            controlled_mask=batch["controlled_mask"].bool(),
+            agent_mask=batch.get("agent_mask").bool() if "agent_mask" in batch else None,
+        )
     for sample_idx in range(batch_size):
         scenario = _scenario_base(batch, sample_idx, max_map_lines=max_map_lines)
+        if rollout_metric_tensors is not None:
+            scenario["metrics"] = serializable_world_metrics(rollout_metric_tensors, sample_idx)
         if rollout_positions is not None:
             positions = _cpu(rollout_positions[sample_idx])
             headings = _cpu(rollout_headings[sample_idx]).float() if rollout_headings is not None else None
             valid = _cpu(rollout_valid[sample_idx]).bool() if rollout_valid is not None else torch.ones(positions.shape[:-1], dtype=torch.bool)
+            num_frames = positions.shape[1]
+            collision = (
+                _pad_event_frames(_cpu(rollout_events["collision"][:, sample_idx]).bool(), num_frames).permute(1, 0)
+                if rollout_events is not None
+                else torch.zeros_like(valid)
+            )
+            offroad = (
+                _pad_event_frames(_cpu(rollout_events["offroad"][:, sample_idx]).bool(), num_frames).permute(1, 0)
+                if rollout_events is not None
+                else torch.zeros_like(valid)
+            )
+            goal_reached_events = (
+                _pad_event_frames(_cpu(rollout_events["goal_reached"][:, sample_idx]).bool(), num_frames).permute(1, 0).cumsum(dim=-1) > 0
+                if rollout_events is not None
+                else None
+            )
             tracks = []
             agent_mask = _cpu(batch.get("agent_mask", torch.ones(positions.shape[0]))[sample_idx]).bool()
             controlled = _cpu(batch.get("controlled_mask", torch.zeros(positions.shape[0]))[sample_idx]).bool()
@@ -308,12 +350,18 @@ def serialize_simulation_batch(
                     "points": _as_list(pts),
                     "controlled": bool(controlled[agent_idx].item()),
                     "valid": _cpu(track_valid[keep]).int().tolist(),
+                    "collision": _cpu(collision[agent_idx, keep]).int().tolist(),
+                    "offroad": _cpu(offroad[agent_idx, keep]).int().tolist(),
                 }
                 if headings is not None:
                     record["headings"] = _as_list(headings[agent_idx, keep], digits=4)
                 if goal_pos is not None and bool(controlled[agent_idx].item()):
                     goal = goal_pos[agent_idx]
-                    reached = (pts - goal).norm(dim=-1) <= goal_reaching_threshold
+                    reached = (
+                        goal_reached_events[agent_idx, keep]
+                        if goal_reached_events is not None
+                        else (pts - goal).norm(dim=-1) <= goal_reaching_threshold
+                    )
                     record["goal"] = _as_list(goal)
                     record["goal_reached"] = _cpu(reached).int().tolist()
                     reached_idx = torch.where(reached)[0]
@@ -323,4 +371,41 @@ def serialize_simulation_batch(
         else:
             scenario["rollout"] = []
         scenarios.append(scenario)
-    return {"task": "simulation", "scenarios": scenarios}
+    payload = {"task": "simulation", "scenarios": scenarios}
+    if rollout_metric_tensors is not None:
+        payload["metrics"] = serializable_batch_metrics(rollout_metric_tensors)
+    elif rollout_positions is not None:
+        total = {"controlled_count": 0, "collision_count": 0, "offroad_count": 0, "goal_reached_count": 0, "done_count": 0}
+        for scenario in scenarios:
+            controlled_tracks = [track for track in scenario.get("rollout", []) if track.get("controlled")]
+            controlled_count = len(controlled_tracks)
+            collision_count = sum(1 for track in controlled_tracks if any(track.get("collision", [])))
+            offroad_count = sum(1 for track in controlled_tracks if any(track.get("offroad", [])))
+            goal_count = sum(1 for track in controlled_tracks if any(track.get("goal_reached", [])))
+            done_count = sum(1 for track in controlled_tracks if any(track.get("collision", [])) or any(track.get("offroad", [])))
+            denom = max(controlled_count, 1)
+            scenario["metrics"] = {
+                "controlled_count": controlled_count,
+                "collision_count": collision_count,
+                "offroad_count": offroad_count,
+                "goal_reached_count": goal_count,
+                "done_count": done_count,
+                "collision_rate": collision_count / denom,
+                "offroad_rate": offroad_count / denom,
+                "goal_reaching_rate": goal_count / denom,
+                "done_rate": done_count / denom,
+            }
+            total["controlled_count"] += controlled_count
+            total["collision_count"] += collision_count
+            total["offroad_count"] += offroad_count
+            total["goal_reached_count"] += goal_count
+            total["done_count"] += done_count
+        denom = max(total["controlled_count"], 1)
+        payload["metrics"] = {
+            **total,
+            "collision_rate": total["collision_count"] / denom,
+            "offroad_rate": total["offroad_count"] / denom,
+            "goal_reaching_rate": total["goal_reached_count"] / denom,
+            "done_rate": total["done_count"] / denom,
+        }
+    return payload

@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from anon_tokyo.simulation.env import ClosedLoopEnv
+from anon_tokyo.simulation.metrics import compute_rollout_metric_tensors, scalar_rollout_metrics
 
 
 _DROP_FROM_POLICY_BUFFER_WHEN_TOKENIZED = {
@@ -179,21 +180,37 @@ class PPOTrainer:
         return action.float(), logprob.float(), entropy.float(), value.float()
 
     @torch.no_grad()
-    def collect_rollout(self, batch: dict[str, Any], sampling_method: str = "sample") -> tuple[RolloutBuffer, dict[str, Any], Tensor]:
+    def collect_rollout(self, batch: dict[str, Any], sampling_method: str = "sample") -> tuple[RolloutBuffer, dict[str, Any], Tensor, dict[str, float]]:
         obs = self.env.reset(batch)
         steps = min(self.config.num_steps, self.env.episode_steps)
         if steps <= 0:
             raise RuntimeError("Batch has no future frames for closed-loop rollout")
         buffer = RolloutBuffer(steps, self.env.num_envs, self.env.num_agents, action_dim=2, device=self.env.device)
         prev_done = torch.zeros(self.env.num_envs, self.env.num_agents, dtype=torch.bool, device=self.env.device)
+        collision_steps = []
+        offroad_steps = []
+        goal_reached_steps = []
         for _ in range(steps):
             action, logprob, _, value = self._policy_forward(obs, sampling_method=sampling_method)
-            next_obs, reward, done, _ = self.env.step(action)
+            next_obs, reward, done, info = self.env.step(action)
+            assert self.env.goal_reached is not None
+            collision_steps.append(info["collision"].detach())
+            offroad_steps.append(info["offroad"].detach())
+            goal_reached_steps.append(self.env.goal_reached.detach())
             train_mask = obs["controlled_mask"].bool() & obs["agent_mask"].bool() & ~prev_done
             buffer.store(obs, action.float(), logprob.float(), value.float(), reward.float(), done, train_mask)
             obs = next_obs
             prev_done = done
-        return buffer, obs, prev_done
+        rollout_metrics = scalar_rollout_metrics(
+            compute_rollout_metric_tensors(
+                collision=torch.stack(collision_steps, dim=0),
+                offroad=torch.stack(offroad_steps, dim=0),
+                goal_reached=torch.stack(goal_reached_steps, dim=0),
+                controlled_mask=buffer.obs[0]["controlled_mask"].bool(),
+                agent_mask=buffer.obs[0]["agent_mask"].bool(),
+            )
+        )
+        return buffer, obs, prev_done, rollout_metrics
 
     @torch.no_grad()
     def estimate_returns_and_advantages(self, buffer: RolloutBuffer, next_obs: dict[str, Any], next_done: Tensor) -> tuple[Tensor, Tensor]:
@@ -281,7 +298,7 @@ class PPOTrainer:
     def train_one_update(self, batch: dict[str, Any], sampling_method: str = "sample") -> dict[str, float]:
         self._sync_timing()
         t0 = time.perf_counter()
-        buffer, next_obs, next_done = self.collect_rollout(batch, sampling_method=sampling_method)
+        buffer, next_obs, next_done, rollout_metrics = self.collect_rollout(batch, sampling_method=sampling_method)
         self._sync_timing()
         t1 = time.perf_counter()
         returns, advantages = self.estimate_returns_and_advantages(buffer, next_obs, next_done)
@@ -292,6 +309,7 @@ class PPOTrainer:
         t3 = time.perf_counter()
         valid_mask = buffer.train_masks
         metrics["mean_reward"] = float(masked_mean(buffer.rewards, valid_mask).detach().cpu()) if valid_mask.any() else 0.0
+        metrics.update(rollout_metrics)
         metrics["rollout_seconds"] = t1 - t0
         metrics["gae_seconds"] = t2 - t1
         metrics["update_seconds"] = t3 - t2

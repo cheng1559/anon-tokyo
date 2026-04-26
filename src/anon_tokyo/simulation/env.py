@@ -82,6 +82,7 @@ class ClosedLoopEnv:
         self.valid: Tensor | None = None
         self.a_long: Tensor | None = None
         self.a_lat: Tensor | None = None
+        self.steering: Tensor | None = None
         self.yaw_rate: Tensor | None = None
         self.jerk_long: Tensor | None = None
         self.jerk_lat: Tensor | None = None
@@ -132,6 +133,7 @@ class ClosedLoopEnv:
         self.valid = self.log_mask[:, :, :end].clone()
         self.a_long = self.log_kinematics["a_long"][:, :, :end].clone()
         self.a_lat = self.log_kinematics["a_lat"][:, :, :end].clone()
+        self.steering = self.log_kinematics["steering"][:, :, :end].clone()
         self.yaw_rate = self.log_kinematics["yaw_rate"][:, :, :end].clone()
         self.jerk_long = torch.zeros_like(self.a_long)
         self.jerk_lat = torch.zeros_like(self.a_lat)
@@ -185,21 +187,22 @@ class ClosedLoopEnv:
         self._assert_ready()
         assert self.positions is not None and self.velocities is not None and self.headings is not None
         assert self.sizes is not None and self.valid is not None and self.a_long is not None
-        assert self.a_lat is not None and self.yaw_rate is not None and self.done is not None
+        assert self.a_lat is not None and self.steering is not None and self.yaw_rate is not None and self.done is not None
         assert self.controlled_mask is not None and self.log_kinematics is not None and self.log_mask is not None
 
         actions = actions.to(self.device, dtype=self.positions.dtype)
         next_index = self.start_index + self.step_count + 1
         latest_valid = self.valid[:, :, -1]
-        active = self.controlled_mask & latest_valid & ~self.done
-        terminal_controlled = self.controlled_mask & self.done
+        active = self.controlled_mask & latest_valid
 
         dyn = self.dynamics.step(
             self.positions[:, :, -1],
             self.velocities[:, :, -1],
             self.headings[:, :, -1],
+            self.sizes[:, :, -1],
             self.a_long[:, :, -1],
             self.a_lat[:, :, -1],
+            self.steering[:, :, -1],
             self.yaw_rate[:, :, -1],
             actions,
         )
@@ -211,26 +214,19 @@ class ClosedLoopEnv:
         log_valid = self.log_mask[:, :, next_index]
         log_a_long = self.log_kinematics["a_long"][:, :, next_index]
         log_a_lat = self.log_kinematics["a_lat"][:, :, next_index]
+        log_steering = self.log_kinematics["steering"][:, :, next_index]
         log_yaw_rate = self.log_kinematics["yaw_rate"][:, :, next_index]
 
         active_e = active.unsqueeze(-1)
-        terminal_e = terminal_controlled.unsqueeze(-1)
-        prev_pos = self.positions[:, :, -1]
-        prev_vel = self.velocities[:, :, -1]
-        prev_heading = self.headings[:, :, -1]
-        prev_size = self.sizes[:, :, -1]
-        prev_a_long = self.a_long[:, :, -1]
-        prev_a_lat = self.a_lat[:, :, -1]
-        prev_yaw_rate = self.yaw_rate[:, :, -1]
-
-        next_pos = torch.where(active_e, dyn["positions"], torch.where(terminal_e, prev_pos, log_pos))
-        next_vel = torch.where(active_e, dyn["velocities"], torch.where(terminal_e, prev_vel, log_vel))
-        next_heading = torch.where(active, dyn["headings"], torch.where(terminal_controlled, prev_heading, log_heading))
-        next_size = torch.where(active_e, self.sizes[:, :, -1], torch.where(terminal_e, prev_size, log_size))
+        next_pos = torch.where(active_e, dyn["positions"], log_pos)
+        next_vel = torch.where(active_e, dyn["velocities"], log_vel)
+        next_heading = torch.where(active, dyn["headings"], log_heading)
+        next_size = torch.where(active_e, self.sizes[:, :, -1], log_size)
         next_valid = torch.where(self.controlled_mask, active, log_valid)
-        next_a_long = torch.where(active, dyn["a_long"], torch.where(terminal_controlled, prev_a_long, log_a_long))
-        next_a_lat = torch.where(active, dyn["a_lat"], torch.where(terminal_controlled, prev_a_lat, log_a_lat))
-        next_yaw_rate = torch.where(active, dyn["yaw_rate"], torch.where(terminal_controlled, prev_yaw_rate, log_yaw_rate))
+        next_a_long = torch.where(active, dyn["a_long"], log_a_long)
+        next_a_lat = torch.where(active, dyn["a_lat"], log_a_lat)
+        next_steering = torch.where(active, dyn["steering"], log_steering)
+        next_yaw_rate = torch.where(active, dyn["yaw_rate"], log_yaw_rate)
         next_jerk_long = torch.where(active, dyn["jerk_long"], torch.zeros_like(log_a_long))
         next_jerk_lat = torch.where(active, dyn["jerk_lat"], torch.zeros_like(log_a_lat))
 
@@ -241,6 +237,7 @@ class ClosedLoopEnv:
         self.valid = torch.cat((self.valid, next_valid.unsqueeze(2)), dim=2)
         self.a_long = torch.cat((self.a_long, next_a_long.unsqueeze(2)), dim=2)
         self.a_lat = torch.cat((self.a_lat, next_a_lat.unsqueeze(2)), dim=2)
+        self.steering = torch.cat((self.steering, next_steering.unsqueeze(2)), dim=2)
         self.yaw_rate = torch.cat((self.yaw_rate, next_yaw_rate.unsqueeze(2)), dim=2)
         self.jerk_long = torch.cat((self.jerk_long, next_jerk_long.unsqueeze(2)), dim=2)
         self.jerk_lat = torch.cat((self.jerk_lat, next_jerk_lat.unsqueeze(2)), dim=2)
@@ -259,6 +256,7 @@ class ClosedLoopEnv:
         self._assert_ready()
         assert self.batch is not None and self.positions is not None and self.velocities is not None
         assert self.headings is not None and self.sizes is not None and self.valid is not None
+        assert self.steering is not None and self.yaw_rate is not None
         H = self.config.history_steps
         B, A, T = self.valid.shape
         start = max(T - H, 0)
@@ -293,6 +291,8 @@ class ClosedLoopEnv:
             "controlled_mask": self.controlled_mask.float(),
             "goal_positions": self.goal_positions,
             "timestep": torch.full((B,), self.step_count, dtype=torch.long, device=self.device),
+            "steering": self.steering[:, :, -1],
+            "yaw_rate": self.yaw_rate[:, :, -1],
         }
         if "scenario_id" in self.batch:
             obs["scenario_id"] = self.batch["scenario_id"]

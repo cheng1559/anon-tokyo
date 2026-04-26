@@ -34,9 +34,23 @@ export interface RolloutTrack {
   headings?: number[]
   controlled?: boolean
   valid?: number[]
+  collision?: number[]
+  offroad?: number[]
   goal?: number[]
   goal_reached?: number[]
   goal_reached_frame?: number | null
+}
+
+export interface SimulationMetrics {
+  controlled_count: number
+  collision_count: number
+  offroad_count: number
+  goal_reached_count: number
+  done_count: number
+  collision_rate: number
+  offroad_rate: number
+  goal_reaching_rate: number
+  done_rate: number
 }
 
 export interface Goal {
@@ -51,11 +65,13 @@ export interface Scenario {
   predictions?: PredictionTrack[]
   rollout?: RolloutTrack[]
   goals?: Goal[]
+  metrics?: SimulationMetrics
 }
 
 export interface BatchPayload {
   task: 'prediction' | 'simulation'
   scenarios: Scenario[]
+  metrics?: SimulationMetrics
 }
 
 export interface EnvInfo {

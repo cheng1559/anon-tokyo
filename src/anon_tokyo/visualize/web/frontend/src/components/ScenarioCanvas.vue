@@ -61,6 +61,8 @@ function getTheme() {
     pedestrian: '#5b9ea6',
     cyclist: '#2dd4bf',
     goal: '#f43f5e',
+    collision: '#ef4444',
+    offroad: '#f97316',
     historyStart: '#ffcf77',
     historyEnd: '#ff4100',
     future: '#e11d48',
@@ -216,7 +218,10 @@ function drawWorldCircle(ctx: CanvasRenderingContext2D, point: number[], color: 
   ctx.restore()
 }
 
-function agentColor(agent: Agent, theme: Theme): string {
+function agentColor(agent: Agent, theme: Theme, goalReached = false, collision = false, offroad = false): string {
+  if (collision) return theme.collision
+  if (offroad) return theme.offroad
+  if (goalReached) return theme.target
   if (agent.controlled) return theme.controlled
   if (agent.sdc) return theme.sdc
   if (agent.target) return theme.target
@@ -272,23 +277,43 @@ function rolloutState(track: RolloutTrack | undefined, frame: number) {
 function isGoalReached(track: RolloutTrack | undefined, frame: number) {
   if (!track?.goal_reached?.length) return false
   const idx = Math.max(0, Math.min(frame, track.goal_reached.length - 1))
-  return Boolean(track.goal_reached[idx])
+  return track.goal_reached.slice(0, idx + 1).some(Boolean)
 }
 
-function drawAgentBox(ctx: CanvasRenderingContext2D, agent: Agent, theme: Theme, state?: { position: number[]; heading?: number } | null) {
+function hasCollision(track: RolloutTrack | undefined, frame: number) {
+  if (!track?.collision?.length) return false
+  const idx = Math.max(0, Math.min(frame, track.collision.length - 1))
+  return Boolean(track.collision[idx])
+}
+
+function hasOffroad(track: RolloutTrack | undefined, frame: number) {
+  if (!track?.offroad?.length) return false
+  const idx = Math.max(0, Math.min(frame, track.offroad.length - 1))
+  return Boolean(track.offroad[idx])
+}
+
+function drawAgentBox(
+  ctx: CanvasRenderingContext2D,
+  agent: Agent,
+  theme: Theme,
+  state?: { position: number[]; heading?: number } | null,
+  goalReached = false,
+  collision = false,
+  offroad = false
+) {
   const [x, y] = state?.position ?? agent.position
   const [lengthRaw, widthRaw] = agent.size ?? [4.5, 2.0]
   const length = Math.max(lengthRaw ?? 4.5, agent.type === 'pedestrian' ? 0.8 : 2.0)
   const width = Math.max(widthRaw ?? 2.0, agent.type === 'pedestrian' ? 0.6 : 1.0)
-  const color = agentColor(agent, theme)
+  const color = agentColor(agent, theme, goalReached, collision, offroad)
 
   ctx.save()
   ctx.translate(x ?? 0, y ?? 0)
   ctx.rotate(state?.heading ?? agent.heading)
-  ctx.fillStyle = mixColor(color, color, 0, agent.controlled || agent.sdc ? 0.42 : 0.22)
+  ctx.fillStyle = mixColor(color, color, 0, collision ? 0.62 : offroad ? 0.58 : goalReached ? 0.55 : agent.controlled || agent.sdc ? 0.42 : 0.22)
   ctx.strokeStyle = color
   const selected = props.selectedAgentId === agent.id
-  ctx.lineWidth = (selected ? 3.4 : agent.controlled || agent.sdc ? 2.6 : 1.6) / zoomLevel.value
+  ctx.lineWidth = (collision ? 4.2 : offroad ? 4.0 : goalReached ? 3.8 : selected ? 3.4 : agent.controlled || agent.sdc ? 2.6 : 1.6) / zoomLevel.value
   ctx.beginPath()
   ctx.rect(-length / 2, -width / 2, length, width)
   ctx.fill()
@@ -385,16 +410,31 @@ function draw() {
     )
   })
   drawPredictions(ctx, scenario, theme)
-  scenario.goals?.forEach((goal) => drawWorldCircle(ctx, goal.point, theme.goal, 8 / zoomLevel.value, true))
   const rolloutByAgent = new Map((scenario.rollout ?? []).map((track) => [track.agent_id, track]))
   scenario.rollout
     ?.filter((track) => track.controlled && track.goal)
     .forEach((track) => {
       const reached = isGoalReached(track, props.frame)
-      drawWorldCircle(ctx, track.goal!, reached ? theme.target : theme.goal, (reached ? 10 : 8) / zoomLevel.value, true)
-      drawWorldCircle(ctx, track.goal!, reached ? theme.target : theme.goal, (reached ? 3.8 : 2.8) / zoomLevel.value)
+      if (reached) return
+      const state = rolloutState(track, props.frame)
+      if (state?.position) {
+        drawWorldLine(ctx, [state.position, track.goal!], theme.goal, 1.5, 0.72, [3, 4])
+      }
+      drawWorldCircle(ctx, track.goal!, theme.goal, 8 / zoomLevel.value, true)
+      drawWorldCircle(ctx, track.goal!, theme.goal, 2.8 / zoomLevel.value)
     })
-  scenario.agents.forEach((agent) => drawAgentBox(ctx, agent, theme, rolloutState(rolloutByAgent.get(agent.id), props.frame)))
+  scenario.agents.forEach((agent) => {
+    const track = rolloutByAgent.get(agent.id)
+    drawAgentBox(
+      ctx,
+      agent,
+      theme,
+      rolloutState(track, props.frame),
+      isGoalReached(track, props.frame),
+      hasCollision(track, props.frame),
+      hasOffroad(track, props.frame)
+    )
+  })
   ctx.restore()
 }
 

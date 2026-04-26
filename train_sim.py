@@ -276,6 +276,9 @@ def main() -> None:
                     data=f"{metrics.get('data_seconds', 0.0):.1f}s",
                     rollout=f"{metrics.get('rollout_seconds', 0.0):.1f}s",
                     upd=f"{metrics.get('update_seconds', 0.0):.1f}s",
+                    coll=f"{metrics.get('collision_rate', 0.0):.3f}",
+                    goal=f"{metrics.get('goal_reaching_rate', 0.0):.3f}",
+                    off=f"{metrics.get('offroad_rate', 0.0):.3f}",
                 )
             if is_rank_zero(rank) and update % log_interval == 0:
                 progress.write(str({"update": update, **metrics}))
