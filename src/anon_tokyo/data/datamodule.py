@@ -5,12 +5,23 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import lightning as L
 import torch
 from torch.utils.data import DataLoader
 
 from anon_tokyo.data.mtr_transform import collate_official_mtr
 from anon_tokyo.data.womd_dataset import WOMDDataset
+
+try:
+    import lightning as L
+except ModuleNotFoundError:
+    class _FallbackDataModule:
+        def save_hyperparameters(self) -> None:
+            return None
+
+    class _FallbackLightning:
+        LightningDataModule = _FallbackDataModule
+
+    L = _FallbackLightning()
 
 
 def collate_fn(batch: list[dict]) -> dict[str, Any]:
@@ -38,6 +49,7 @@ class WOMDDataModule(L.LightningDataModule):
         npz_root: str | None = None,
         transform: str = "scene",
         include_eval_meta: bool = False,
+        simulation_control_mode: str = "tracks_to_predict",
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -53,6 +65,7 @@ class WOMDDataModule(L.LightningDataModule):
             npz_root=npz_root,
             transform=transform,
             include_eval_meta=include_eval_meta,
+            simulation_control_mode=simulation_control_mode,
         )
         self.transform = transform
 

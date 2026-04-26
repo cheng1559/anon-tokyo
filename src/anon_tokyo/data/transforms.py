@@ -66,6 +66,96 @@ def break_polylines(
 MAX_TRACKS_TO_PREDICT = 8
 
 
+def _select_scene_agents(
+    *,
+    valid: np.ndarray,
+    tracks_to_predict: np.ndarray,
+    sdc_idx: int,
+    max_agents: int,
+    history_len: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select and reindex scene agents with the same priority as scene transform."""
+    num_agents = valid.shape[0]
+    hist_mask = valid[:, :history_len]
+    has_history = hist_mask.any(axis=1)
+    valid_ttp = tracks_to_predict[(tracks_to_predict >= 0) & (tracks_to_predict < num_agents)]
+
+    keep = has_history.copy().astype(bool)
+    keep[valid_ttp] = True
+    if 0 <= sdc_idx < num_agents:
+        keep[sdc_idx] = True
+    keep_idx = np.where(keep)[0]
+
+    if len(keep_idx) > max_agents:
+        priority = np.zeros(num_agents, dtype=np.float32)
+        priority[keep_idx] = 1
+        priority[valid_ttp] = 2
+        if 0 <= sdc_idx < num_agents:
+            priority[sdc_idx] = 3
+        keep_idx = np.sort(np.argsort(-priority)[:max_agents])
+
+    old_to_new = np.full(num_agents, -1, dtype=np.int32)
+    old_to_new[keep_idx] = np.arange(len(keep_idx), dtype=np.int32)
+    return keep_idx, old_to_new
+
+
+def _build_map_token_features(polys: np.ndarray, poly_mask: np.ndarray, poly_centers: np.ndarray) -> np.ndarray:
+    """Aggregate each fixed-size map polyline into one scene-frame token."""
+    M, P, _ = polys.shape
+    token_features = np.zeros((M, 11), dtype=np.float32)
+    valid_poly = poly_mask.any(axis=1)
+    if not valid_poly.any():
+        return token_features
+
+    token_features[:, 0:2] = poly_centers.astype(np.float32)
+    point_order = np.arange(P, dtype=np.int32)[None, :]
+    first_idx = np.where(poly_mask > 0, point_order, P).min(axis=1).clip(max=P - 1)
+    last_idx = np.where(poly_mask > 0, point_order, 0).max(axis=1)
+    rows = np.arange(M)
+    first_xy = polys[rows, first_idx, 0:2]
+    last_xy = polys[rows, last_idx, 0:2]
+    token_features[:, 2:4] = first_xy
+    token_features[:, 4:6] = last_xy
+
+    segment = last_xy - first_xy
+    seg_norm = np.linalg.norm(segment, axis=-1, keepdims=True)
+    dir_xy = segment / np.clip(seg_norm, 1e-6, None)
+    mask_f = poly_mask.astype(np.float32)
+    count = np.clip(mask_f.sum(axis=1, keepdims=True), 1.0, None)
+    mean_dir = (polys[:, :, 3:5] * mask_f[:, :, None]).sum(axis=1)
+    mean_norm = np.linalg.norm(mean_dir, axis=-1, keepdims=True)
+    mean_dir = mean_dir / np.clip(mean_norm, 1e-6, None)
+    dir_xy = np.where(seg_norm > 1e-4, dir_xy, mean_dir)
+    token_features[:, 6:8] = dir_xy
+
+    edge_len = np.linalg.norm(polys[:, 1:, 0:2] - polys[:, :-1, 0:2], axis=-1)
+    edge_mask = (poly_mask[:, 1:] > 0) & (poly_mask[:, :-1] > 0)
+    token_features[:, 8:9] = (edge_len * edge_mask.astype(np.float32)).sum(axis=1, keepdims=True)
+    token_features[:, 9:10] = (polys[:, :, 2] * mask_f).sum(axis=1, keepdims=True) / count
+    token_features[:, 10:11] = (polys[:, :, 6] * mask_f).sum(axis=1, keepdims=True) / count
+    token_features[~valid_poly] = 0.0
+    return token_features
+
+
+def _transform_scene_trajs(data: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, float, int, int, int]:
+    """Return full trajectories in the SDC frame used by scene-centric models."""
+    current_t = int(data["current_time_index"])
+    sdc_idx = int(data["sdc_track_index"])
+    trajs = data["trajs"]  # (A, T, 10)
+    num_agents, num_timestamps, _ = trajs.shape
+
+    sdc_state = trajs[sdc_idx, current_t]
+    center_xy = sdc_state[0:2].copy()
+    center_heading = float(sdc_state[6])
+
+    t = trajs.copy()
+    t[:, :, 0:2] -= center_xy[None, None, :]
+    t[:, :, 0:2] = rotate_2d(t[:, :, 0:2].reshape(-1, 2), -center_heading).reshape(num_agents, num_timestamps, 2)
+    t[:, :, 7:9] = rotate_2d(t[:, :, 7:9].reshape(-1, 2), -center_heading).reshape(num_agents, num_timestamps, 2)
+    t[:, :, 6] -= center_heading
+    return t, center_xy, center_heading, current_t, sdc_idx, num_timestamps
+
+
 def scene_centric_transform(
     data: dict[str, np.ndarray],
     *,
@@ -78,24 +168,11 @@ def scene_centric_transform(
 ) -> dict[str, np.ndarray]:
     """Transform a raw scenario dict into scene-centric padded features."""
 
-    current_t = int(data["current_time_index"])
-    sdc_idx = int(data["sdc_track_index"])
     trajs = data["trajs"]  # (A, 91, 10)
     num_agents, num_timestamps, _ = trajs.shape
+    t, center_xy, center_heading, current_t, sdc_idx, _ = _transform_scene_trajs(data)
     history_len = current_t + 1
     future_len = num_timestamps - history_len
-
-    # ── SDC reference frame ──────────────────────────────────────────────
-    sdc_state = trajs[sdc_idx, current_t]
-    center_xy = sdc_state[0:2].copy()
-    center_heading = float(sdc_state[6])
-
-    # ── Transform trajectories ───────────────────────────────────────────
-    t = trajs.copy()
-    t[:, :, 0:2] -= center_xy[None, None, :]
-    t[:, :, 0:2] = rotate_2d(t[:, :, 0:2].reshape(-1, 2), -center_heading).reshape(num_agents, num_timestamps, 2)
-    t[:, :, 7:9] = rotate_2d(t[:, :, 7:9].reshape(-1, 2), -center_heading).reshape(num_agents, num_timestamps, 2)
-    t[:, :, 6] -= center_heading
 
     valid = t[:, :, 9]  # (A, T)
 
@@ -147,22 +224,13 @@ def scene_centric_transform(
     tracks_to_predict = data["tracks_to_predict"].astype(np.int32)
 
     # ── Agent selection / reindex ────────────────────────────────────────
-    has_history = hist_mask.any(axis=1)
-    keep = has_history.copy().astype(bool)
-    keep[tracks_to_predict] = True
-    keep[sdc_idx] = True
-    keep_idx = np.where(keep)[0]
-
-    if len(keep_idx) > max_agents:
-        # Priority: sdc=3, tracks_to_predict=2, valid=1
-        priority = np.zeros(num_agents, dtype=np.float32)
-        priority[keep_idx] = 1
-        priority[tracks_to_predict] = 2
-        priority[sdc_idx] = 3
-        keep_idx = np.sort(np.argsort(-priority)[:max_agents])
-
-    old_to_new = np.full(num_agents, -1, dtype=np.int32)
-    old_to_new[keep_idx] = np.arange(len(keep_idx), dtype=np.int32)
+    keep_idx, old_to_new = _select_scene_agents(
+        valid=valid,
+        tracks_to_predict=tracks_to_predict,
+        sdc_idx=sdc_idx,
+        max_agents=max_agents,
+        history_len=history_len,
+    )
     n = len(keep_idx)
 
     A = max_agents
@@ -237,6 +305,7 @@ def scene_centric_transform(
     csum = (p_polys[:, :, 0:2] * p_poly_mask[:, :, None]).sum(axis=1)
     ccnt = np.clip(p_poly_mask.sum(axis=1, keepdims=True), 1, None)
     poly_centers = (csum / ccnt).astype(np.float32)
+    map_token_features = _build_map_token_features(p_polys, p_poly_mask, poly_centers)
 
     # Polyline headings (for DRoPE): direction from first to last valid point
     map_headings = np.zeros(M, dtype=np.float32)
@@ -265,6 +334,7 @@ def scene_centric_transform(
         "map_polylines": p_polys,  # (M, P_pts, 7)
         "map_polylines_mask": p_poly_mask,  # (M, P_pts)
         "map_polylines_center": poly_centers,  # (M, 2)
+        "map_token_features": map_token_features,  # (M, 11)
         "map_headings": map_headings,  # (M,)
         "map_mask": map_element_mask,  # (M,)
         # Future (ego frame)
@@ -297,4 +367,78 @@ def scene_centric_transform(
             }
         )
 
+    return out
+
+
+def simulation_transform(
+    data: dict[str, np.ndarray],
+    *,
+    max_agents: int = 128,
+    max_polylines: int = 4096,
+    num_points_per_polyline: int = 20,
+    vector_break_dist: float = 1.0,
+    center_offset_of_map: tuple[float, float] = (30.0, 0.0),
+    control_mode: str = "tracks_to_predict",
+) -> dict[str, np.ndarray]:
+    """Scene-centric transform with extra closed-loop simulation tensors.
+
+    The returned sample keeps the prediction field names and adds only the
+    tensors needed by the simulator: full log trajectories, timestamps and a
+    boolean controlled mask derived from valid ``tracks_to_predict`` entries.
+    """
+    out = scene_centric_transform(
+        data,
+        max_agents=max_agents,
+        max_polylines=max_polylines,
+        num_points_per_polyline=num_points_per_polyline,
+        vector_break_dist=vector_break_dist,
+        center_offset_of_map=center_offset_of_map,
+        include_eval_meta=False,
+    )
+
+    t, _, _, current_t, sdc_idx, num_timestamps = _transform_scene_trajs(data)
+    valid = t[:, :, 9]
+    tracks_to_predict = data["tracks_to_predict"].astype(np.int32)
+    keep_idx, old_to_new = _select_scene_agents(
+        valid=valid,
+        tracks_to_predict=tracks_to_predict,
+        sdc_idx=sdc_idx,
+        max_agents=max_agents,
+        history_len=current_t + 1,
+    )
+
+    A = max_agents
+    p_full = np.zeros((A, num_timestamps, t.shape[-1]), dtype=np.float32)
+    p_full_mask = np.zeros((A, num_timestamps), dtype=np.float32)
+    n = len(keep_idx)
+    p_full[:n] = t[keep_idx].astype(np.float32)
+    p_full_mask[:n] = valid[keep_idx].astype(np.float32)
+    p_full[p_full_mask == 0] = 0
+
+    new_ttp = old_to_new[tracks_to_predict[(tracks_to_predict >= 0) & (tracks_to_predict < t.shape[0])]]
+    controlled_mask = np.zeros(A, dtype=np.bool_)
+    if control_mode in {"non_reactive", "sdc", "ego"}:
+        if 0 <= int(out["sdc_track_index"]) < A:
+            controlled_mask[int(out["sdc_track_index"])] = True
+    elif control_mode == "tracks_to_predict":
+        valid_new_ttp = new_ttp[(new_ttp >= 0) & (new_ttp < A)]
+        controlled_mask[valid_new_ttp] = True
+    else:
+        raise ValueError(f"Unsupported simulation control_mode: {control_mode}")
+    controlled_mask &= out["agent_mask"].astype(bool)
+    controlled_mask &= p_full_mask[:, current_t].astype(bool)
+
+    timestamps = data.get("timestamps")
+    if timestamps is None:
+        timestamps = np.arange(num_timestamps, dtype=np.float32) * 0.1
+
+    out.update(
+        {
+            "obj_trajs_full": p_full,
+            "obj_trajs_full_mask": p_full_mask,
+            "controlled_mask": controlled_mask,
+            "current_time_index": np.int32(current_t),
+            "timestamps": np.asarray(timestamps, dtype=np.float32),
+        }
+    )
     return out

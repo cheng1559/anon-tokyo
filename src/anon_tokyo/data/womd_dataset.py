@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from anon_tokyo.data.shard_io import ShardIndex, read_item
 from anon_tokyo.data.mtr_transform import official_mtr_transform
-from anon_tokyo.data.transforms import scene_centric_transform
+from anon_tokyo.data.transforms import scene_centric_transform, simulation_transform
 
 
 class WOMDDataset(Dataset):
@@ -32,6 +32,7 @@ class WOMDDataset(Dataset):
         npz_root: str | Path | None = None,
         transform: str = "scene",
         include_eval_meta: bool = False,
+        simulation_control_mode: str = "tracks_to_predict",
     ) -> None:
         self.max_agents = max_agents
         self.max_polylines = max_polylines
@@ -39,6 +40,7 @@ class WOMDDataset(Dataset):
         self.use_npz = use_npz
         self.transform = transform
         self.include_eval_meta = include_eval_meta
+        self.simulation_control_mode = simulation_control_mode
 
         self.split_dir = Path(data_root) / split
         self.index = ShardIndex.load(self.split_dir / "index.json")
@@ -85,13 +87,22 @@ class WOMDDataset(Dataset):
                 num_points_per_polyline=self.num_points_per_polyline,
             )
             return sample  # collate_official_mtr handles numpy arrays directly
-        sample = scene_centric_transform(
-            data,
-            max_agents=self.max_agents,
-            max_polylines=self.max_polylines,
-            num_points_per_polyline=self.num_points_per_polyline,
-            include_eval_meta=self.include_eval_meta,
-        )
+        if self.transform == "simulation":
+            sample = simulation_transform(
+                data,
+                max_agents=self.max_agents,
+                max_polylines=self.max_polylines,
+                num_points_per_polyline=self.num_points_per_polyline,
+                control_mode=self.simulation_control_mode,
+            )
+        else:
+            sample = scene_centric_transform(
+                data,
+                max_agents=self.max_agents,
+                max_polylines=self.max_polylines,
+                num_points_per_polyline=self.num_points_per_polyline,
+                include_eval_meta=self.include_eval_meta,
+            )
 
         out: dict[str, torch.Tensor | str] = {}
         for key, val in sample.items():

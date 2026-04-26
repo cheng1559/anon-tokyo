@@ -1,0 +1,79 @@
+# Agent-centric closed-loop PPO.
+seed_everything: 42
+
+model:
+  class_path: anon_tokyo.simulation.agent_centric.model.AgentCentricModel
+  init_args:
+    d_model: 128
+    num_layers: 2
+    num_heads: 4
+    sparse_k: 16
+    dropout: 0.1
+    max_context_agents: 32
+    max_context_maps: 128
+    use_map_self_attention: false
+    action_low: [-5.0, -1.0]
+    action_high: [3.0, 1.0]
+
+data:
+  data_root: data/shards
+  split: training
+  batch_size: 1024
+  num_workers: 4
+  max_agents: 64
+  max_polylines: 128
+  num_points_per_polyline: 20
+  use_npz: true
+  npz_root: data/processed
+  transform: simulation
+  simulation_control_mode: non_reactive
+
+env:
+  device: cuda
+  num_steps: 80
+  history_steps: 5
+  goal_sampling_mode: last
+  goal_sampling_gamma: 2.0
+  dynamics:
+    min_jerk_long: -5.0
+    max_jerk_long: 3.0
+    min_jerk_lat: -1.0
+    max_jerk_lat: 1.0
+    min_a_long: -6.5
+    max_a_long: 1.5
+    min_a_lat: -3.0
+    max_a_lat: 3.0
+    max_speed: 40.0
+  rewards:
+    collision_reward_weight: -1.0
+    offroad_reward_weight: -1.0
+    offroad_distance_threshold: 0.35
+    goal_reaching_threshold: 1.5
+    goal_reaching_weight: 0.5
+    ttc_horizon: 4.0
+    ttc_reward_floor: 0.1
+    ttc_radius_buffer: 0.25
+    comfort_weight: 0.5
+
+ppo:
+  learning_rate: 3.0e-4
+  num_updates: 1500
+  num_steps: 80
+  minibatch_size: 10240
+  optimization_epochs: 4
+  clip_epsilon: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  entropy_coeff: 0.01
+  value_coeff: 0.5
+  max_grad_norm: 0.5
+  norm_adv: true
+  clip_vloss: true
+  vf_clip_epsilon: 0.2
+  target_kl: null
+  use_bf16: true
+
+trainer:
+  log_dir: tb_logs/simulation_agent_centric
+  log_interval: 20
+  save_interval: 100
