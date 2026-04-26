@@ -18,10 +18,10 @@ model:
 data:
   data_root: data/shards
   split: training
-  batch_size: 2048
+  batch_size: 1024
   num_workers: 4
   max_agents: 64
-  max_polylines: 768
+  max_polylines: 512
   num_points_per_polyline: 20
   use_npz: true
   npz_root: data/processed
@@ -60,8 +60,8 @@ ppo:
   num_updates: null
   total_epochs: 300
   num_steps: 80
-  minibatch_size: 20480
-  optimization_epochs: 4
+  minibatch_size: 10240
+  optimization_epochs: 1
   clip_epsilon: 0.2
   gamma: 0.99
   gae_lambda: 0.95

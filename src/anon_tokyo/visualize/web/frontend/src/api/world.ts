@@ -17,6 +17,7 @@ export async function initializeEnv(payload: {
   checkpoint_path?: string | null
   split?: string | null
   batch_size: number
+  simulation_control_mode?: string
 }): Promise<EnvInfo> {
   const response = await client.post<EnvInfo>('/env', payload)
   return response.data

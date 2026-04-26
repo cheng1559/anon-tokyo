@@ -384,7 +384,7 @@ def simulation_transform(
 
     The returned sample keeps the prediction field names and adds only the
     tensors needed by the simulator: full log trajectories, timestamps and a
-    boolean controlled mask derived from valid ``tracks_to_predict`` entries.
+    boolean controlled mask derived from ``control_mode``.
     """
     out = scene_centric_transform(
         data,
@@ -423,6 +423,8 @@ def simulation_transform(
     elif control_mode == "tracks_to_predict":
         valid_new_ttp = new_ttp[(new_ttp >= 0) & (new_ttp < A)]
         controlled_mask[valid_new_ttp] = True
+    elif control_mode in {"all", "all_agents"}:
+        controlled_mask[:] = True
     else:
         raise ValueError(f"Unsupported simulation control_mode: {control_mode}")
     controlled_mask &= out["agent_mask"].astype(bool)

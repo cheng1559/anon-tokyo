@@ -71,6 +71,18 @@ def test_simulation_transform_adds_controlled_mask_and_full_trajs() -> None:
     assert int(out["current_time_index"]) == 3
 
 
+def test_simulation_transform_all_agents_control_mode_controls_current_valid_agents() -> None:
+    scenario = _make_scenario()
+    current_t = int(scenario["current_time_index"])
+    scenario["trajs"][3, current_t, 9] = 0.0
+
+    out = simulation_transform(scenario, max_agents=8, max_polylines=8, control_mode="all_agents")
+    expected = out["agent_mask"].astype(bool) & out["obj_trajs_full_mask"][:, current_t].astype(bool)
+
+    np.testing.assert_array_equal(out["controlled_mask"], expected)
+    assert out["controlled_mask"].sum() == 3
+
+
 def test_jerk_pnc_longitudinal_and_lateral_actions() -> None:
     model = JerkPncModel(JerkPncConfig(dt=0.1, max_jerk_long=3.0, max_jerk_lat=1.0))
     positions = torch.zeros(1, 1, 2)
@@ -174,6 +186,18 @@ def test_rewards_collision_offroad_ttc_goal() -> None:
     assert info["ttc_alert"][0, 0]
 
 
+def test_offroad_ignores_solid_lane_lines() -> None:
+    state = _reward_state()
+    state["positions"] = torch.tensor([[[0.0, 0.0], [8.0, 0.0], [20.0, 0.0]]])
+    state["controlled_mask"] = torch.tensor([[True, False, False]])
+    state["map_polylines"][0, 0, :, 6] = 7.0
+
+    _, done, info, _ = compute_rewards(state, RewardConfig(offroad_distance_threshold=0.2))
+
+    assert not info["offroad"][0, 0]
+    assert not done[0, 0]
+
+
 def test_agent_centric_policy_forward_shapes() -> None:
     batch = _batch(max_agents=4)
     env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=4))
@@ -201,6 +225,53 @@ def test_agent_centric_policy_forward_shapes() -> None:
     assert torch.all(action[..., 0] <= 3.0)
     assert torch.all(action[..., 1] >= -1.0)
     assert torch.all(action[..., 1] <= 1.0)
+
+
+def test_agent_centric_encoder_uses_nearest_local_context() -> None:
+    A = 40
+    M = 160
+    T = 2
+    P = 2
+    positions = torch.stack((torch.arange(A, dtype=torch.float32), torch.zeros(A)), dim=-1).unsqueeze(0)
+    map_centers = torch.stack((torch.arange(M, dtype=torch.float32), torch.zeros(M)), dim=-1).unsqueeze(0)
+    obj_trajs = torch.zeros(1, A, T, 10)
+    obj_trajs[..., 0:2] = positions[:, :, None, :]
+    obj_trajs[..., 3:6] = torch.tensor([4.5, 2.0, 1.5])
+    obj_trajs[..., 7] = 1.0
+
+    map_polys = torch.zeros(1, M, P, 7)
+    map_polys[..., 0:2] = map_centers[:, :, None, :]
+    map_polys[..., 1, 0] += 0.5
+    map_polys[..., 3] = 1.0
+
+    obs = {
+        "obj_trajs": obj_trajs,
+        "obj_trajs_mask": torch.ones(1, A, T),
+        "obj_positions": positions,
+        "obj_headings": torch.zeros(1, A),
+        "obj_types": torch.ones(1, A, dtype=torch.long),
+        "agent_mask": torch.ones(1, A, dtype=torch.bool),
+        "controlled_mask": torch.tensor([[True] + [False] * (A - 1)]),
+        "map_polylines": map_polys,
+        "map_polylines_mask": torch.ones(1, M, P),
+        "map_polylines_center": map_centers,
+        "map_mask": torch.ones(1, M, dtype=torch.bool),
+    }
+    policy = AgentCentricModel(
+        d_model=32,
+        num_layers=0,
+        num_heads=4,
+        sparse_k=4,
+        max_context_agents=32,
+        max_context_maps=128,
+    )
+
+    encoded = policy.encoder(obs)
+
+    assert encoded["context_agent_indices"].shape == (1, A, 32)
+    assert encoded["context_map_indices"].shape == (1, A, 128)
+    torch.testing.assert_close(encoded["context_agent_indices"][0, 0], torch.arange(32))
+    torch.testing.assert_close(encoded["context_map_indices"][0, 0], torch.arange(128))
 
 
 class TinyPolicy(nn.Module):

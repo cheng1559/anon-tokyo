@@ -22,6 +22,7 @@ from anon_tokyo.data.datamodule import collate_fn
 from anon_tokyo.data.womd_dataset import WOMDDataset
 from anon_tokyo.simulation.env import ClosedLoopEnv, ClosedLoopEnvConfig
 from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer
+from anon_tokyo.simulation.profiling import TimingProfiler
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +33,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--npz_root", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--max_agents", type=int, default=None)
+    parser.add_argument("--max_polylines", type=int, default=None)
+    parser.add_argument("--rollout_steps", type=int, default=None, help="Override both env.num_steps and ppo.num_steps")
+    parser.add_argument("--minibatch_size", type=int, default=None)
+    parser.add_argument("--optimization_epochs", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--smoke_env", action="store_true", help="Run reset + one zero-action env step without a policy")
+    parser.add_argument("--profile", action="store_true", help="Emit fine-grained timing metrics for one or more updates")
+    parser.add_argument(
+        "--profile_cuda_sync",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Synchronize CUDA around profile regions for more accurate GPU timings",
+    )
     return parser.parse_args()
 
 
@@ -132,8 +146,25 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg.setdefault("data", {})["npz_root"] = args.npz_root
     if args.batch_size is not None:
         cfg.setdefault("data", {})["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        cfg.setdefault("data", {})["num_workers"] = args.num_workers
+    if args.max_agents is not None:
+        cfg.setdefault("data", {})["max_agents"] = args.max_agents
+    if args.max_polylines is not None:
+        cfg.setdefault("data", {})["max_polylines"] = args.max_polylines
+    if args.rollout_steps is not None:
+        cfg.setdefault("env", {})["num_steps"] = args.rollout_steps
+        cfg.setdefault("ppo", {})["num_steps"] = args.rollout_steps
+    if args.minibatch_size is not None:
+        cfg.setdefault("ppo", {})["minibatch_size"] = args.minibatch_size
+    if args.optimization_epochs is not None:
+        cfg.setdefault("ppo", {})["optimization_epochs"] = args.optimization_epochs
     if args.device is not None:
         cfg.setdefault("env", {})["device"] = args.device
+    if args.profile:
+        cfg.setdefault("ppo", {})["profile"] = True
+    if args.profile_cuda_sync is not None:
+        cfg.setdefault("ppo", {})["profile_cuda_sync"] = args.profile_cuda_sync
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -147,6 +178,16 @@ def reduce_metrics(metrics: dict[str, float], is_distributed: bool, device: torc
     values = torch.tensor([metrics[k] for k in keys], dtype=torch.float64, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.AVG)
     return {key: float(value.detach().cpu()) for key, value in zip(keys, values)}
+
+
+def top_profile_seconds(metrics: dict[str, float], limit: int = 16) -> dict[str, float]:
+    items = [
+        (key.removeprefix("profile_").removesuffix("_seconds"), value)
+        for key, value in metrics.items()
+        if key.startswith("profile_") and key.endswith("_seconds")
+    ]
+    items.sort(key=lambda item: item[1], reverse=True)
+    return {key: round(value, 4) for key, value in items[:limit]}
 
 
 def warn_single_process_heavy_config(cfg: dict[str, Any], world_size: int) -> None:
@@ -197,17 +238,29 @@ def main() -> None:
                         "global_batch_size": per_gpu_batch * world_size,
                     }
                 )
-            obs = env.reset(batch)
+            profiler = TimingProfiler(
+                enabled=bool(cfg.get("ppo", {}).get("profile", False)),
+                device=env.device,
+                sync_cuda=bool(cfg.get("ppo", {}).get("profile_cuda_sync", True)),
+            )
+            env.profiler = profiler if profiler.enabled else None
+            with profiler.record("smoke.env_reset"):
+                obs = env.reset(batch)
             actions = torch.zeros(obs["controlled_mask"].shape[0], obs["controlled_mask"].shape[1], 2, device=env.device)
-            _, reward, done, info = env.step(actions)
+            with profiler.record("smoke.env_step"):
+                _, reward, done, info = env.step(actions)
             metrics = {
                 "reward_mean": float(reward.mean().detach().cpu()),
                 "done_count": int(done.sum().detach().cpu()),
                 "controlled_count": int(obs["controlled_mask"].sum().detach().cpu()),
                 "collision_count": int(info["collision"].sum().detach().cpu()),
             }
+            metrics.update(profiler.metrics())
             if is_rank_zero(rank):
-                print(reduce_metrics(metrics, is_distributed, device))
+                metrics = reduce_metrics(metrics, is_distributed, device)
+                print(metrics)
+                if profiler.enabled:
+                    print({"profile_top_seconds": top_profile_seconds(metrics)})
             elif is_distributed:
                 reduce_metrics(metrics, is_distributed, device)
             return
@@ -280,6 +333,8 @@ def main() -> None:
                     goal=f"{metrics.get('goal_reaching_rate', 0.0):.3f}",
                     off=f"{metrics.get('offroad_rate', 0.0):.3f}",
                 )
+                if ppo_cfg.profile:
+                    progress.write(str({"update": update, "profile_top_seconds": top_profile_seconds(metrics)}))
             if is_rank_zero(rank) and update % log_interval == 0:
                 progress.write(str({"update": update, **metrics}))
                 writer.flush()

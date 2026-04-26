@@ -83,6 +83,7 @@ export interface EnvInfo {
   split: string
   batch_size: number
   dataset_size: number
+  simulation_control_mode?: string
 }
 
 export interface FileCatalog {

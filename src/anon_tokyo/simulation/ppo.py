@@ -13,6 +13,7 @@ from torch import Tensor
 
 from anon_tokyo.simulation.env import ClosedLoopEnv
 from anon_tokyo.simulation.metrics import compute_rollout_metric_tensors, scalar_rollout_metrics
+from anon_tokyo.simulation.profiling import TimingProfiler
 
 
 _DROP_FROM_POLICY_BUFFER_WHEN_TOKENIZED = {
@@ -45,6 +46,8 @@ class PPOConfig:
     vf_clip_epsilon: float = 0.2
     target_kl: float | None = None
     use_bf16: bool = False
+    profile: bool = False
+    profile_cuda_sync: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PPOConfig":
@@ -154,6 +157,12 @@ class PPOTrainer:
         self.policy = policy.to(env.device)
         self.config = config if isinstance(config, PPOConfig) else PPOConfig.from_dict(config)
         self.optimizer = optimizer or torch.optim.Adam(self.policy.parameters(), lr=self.config.learning_rate, eps=1e-5)
+        self.profiler = TimingProfiler(
+            enabled=self.config.profile,
+            device=self.env.device,
+            sync_cuda=self.config.profile_cuda_sync,
+        )
+        self.env.profiler = self.profiler if self.config.profile else None
 
     def _autocast_enabled(self) -> bool:
         return self.config.use_bf16 and self.env.device.type == "cuda"
@@ -179,9 +188,17 @@ class PPOTrainer:
             action, logprob, entropy, value = self.policy(obs, **kwargs)
         return action.float(), logprob.float(), entropy.float(), value.float()
 
+    def _set_policy_profiler(self) -> None:
+        profiler = self.profiler if self.config.profile else None
+        for module in self.policy.modules():
+            setattr(module, "_profiler", profiler)
+
     @torch.no_grad()
     def collect_rollout(self, batch: dict[str, Any], sampling_method: str = "sample") -> tuple[RolloutBuffer, dict[str, Any], Tensor, dict[str, float]]:
-        obs = self.env.reset(batch)
+        self._set_policy_profiler()
+        self.env.profiler = self.profiler if self.config.profile else None
+        with self.profiler.record("rollout.env_reset"):
+            obs = self.env.reset(batch)
         steps = min(self.config.num_steps, self.env.episode_steps)
         if steps <= 0:
             raise RuntimeError("Batch has no future frames for closed-loop rollout")
@@ -191,47 +208,57 @@ class PPOTrainer:
         offroad_steps = []
         goal_reached_steps = []
         for _ in range(steps):
-            action, logprob, _, value = self._policy_forward(obs, sampling_method=sampling_method)
-            next_obs, reward, done, info = self.env.step(action)
+            with self.profiler.record("rollout.policy_forward"):
+                action, logprob, _, value = self._policy_forward(obs, sampling_method=sampling_method)
+            with self.profiler.record("rollout.env_step"):
+                next_obs, reward, done, info = self.env.step(action)
             assert self.env.goal_reached is not None
-            collision_steps.append(info["collision"].detach())
-            offroad_steps.append(info["offroad"].detach())
-            goal_reached_steps.append(self.env.goal_reached.detach())
+            with self.profiler.record("rollout.metrics_collect"):
+                collision_steps.append(info["collision"].detach())
+                offroad_steps.append(info["offroad"].detach())
+                goal_reached_steps.append(self.env.goal_reached.detach())
             train_mask = obs["controlled_mask"].bool() & obs["agent_mask"].bool() & ~prev_done
-            buffer.store(obs, action.float(), logprob.float(), value.float(), reward.float(), done, train_mask)
+            with self.profiler.record("rollout.buffer_store"):
+                buffer.store(obs, action.float(), logprob.float(), value.float(), reward.float(), done, train_mask)
             obs = next_obs
             prev_done = done
-        rollout_metrics = scalar_rollout_metrics(
-            compute_rollout_metric_tensors(
-                collision=torch.stack(collision_steps, dim=0),
-                offroad=torch.stack(offroad_steps, dim=0),
-                goal_reached=torch.stack(goal_reached_steps, dim=0),
-                controlled_mask=buffer.obs[0]["controlled_mask"].bool(),
-                agent_mask=buffer.obs[0]["agent_mask"].bool(),
+        with self.profiler.record("rollout.metric_reduce"):
+            rollout_metrics = scalar_rollout_metrics(
+                compute_rollout_metric_tensors(
+                    collision=torch.stack(collision_steps, dim=0),
+                    offroad=torch.stack(offroad_steps, dim=0),
+                    goal_reached=torch.stack(goal_reached_steps, dim=0),
+                    controlled_mask=buffer.obs[0]["controlled_mask"].bool(),
+                    agent_mask=buffer.obs[0]["agent_mask"].bool(),
+                )
             )
-        )
         return buffer, obs, prev_done, rollout_metrics
 
     @torch.no_grad()
     def estimate_returns_and_advantages(self, buffer: RolloutBuffer, next_obs: dict[str, Any], next_done: Tensor) -> tuple[Tensor, Tensor]:
-        _, _, _, next_value = self._policy_forward(next_obs, sampling_method="sample")
+        self._set_policy_profiler()
+        with self.profiler.record("gae.bootstrap_policy_forward"):
+            _, _, _, next_value = self._policy_forward(next_obs, sampling_method="sample")
         next_value = next_value.float()
-        advantages = torch.zeros_like(buffer.rewards)
-        last_gae = torch.zeros_like(next_value)
-        for t in reversed(range(buffer.size)):
-            next_nonterminal = 1.0 - (next_done.float() if t == buffer.size - 1 else buffer.dones[t].float())
-            next_values = next_value if t == buffer.size - 1 else buffer.values[t + 1]
-            delta = buffer.rewards[t] + self.config.gamma * next_values * next_nonterminal - buffer.values[t]
-            last_gae = delta + self.config.gamma * self.config.gae_lambda * next_nonterminal * last_gae
-            advantages[t] = last_gae
+        with self.profiler.record("gae.compute"):
+            advantages = torch.zeros_like(buffer.rewards)
+            last_gae = torch.zeros_like(next_value)
+            for t in reversed(range(buffer.size)):
+                next_nonterminal = 1.0 - (next_done.float() if t == buffer.size - 1 else buffer.dones[t].float())
+                next_values = next_value if t == buffer.size - 1 else buffer.values[t + 1]
+                delta = buffer.rewards[t] + self.config.gamma * next_values * next_nonterminal - buffer.values[t]
+                last_gae = delta + self.config.gamma * self.config.gae_lambda * next_nonterminal * last_gae
+                advantages[t] = last_gae
         returns = advantages + buffer.values
         return returns, advantages
 
     def update(self, buffer: RolloutBuffer, returns: Tensor, advantages: Tensor) -> dict[str, float]:
+        self._set_policy_profiler()
         total_samples = buffer.size * buffer.num_envs
         minibatch_size = self.config.minibatch_size or total_samples
         flat_indices = torch.arange(total_samples, device=self.env.device)
-        stacked_obs, static_obs_keys = stack_obs_steps(buffer.obs)
+        with self.profiler.record("update.stack_obs"):
+            stacked_obs, static_obs_keys = stack_obs_steps(buffer.obs)
         metrics: dict[str, list[float]] = {"policy_loss": [], "value_loss": [], "entropy": [], "approx_kl": [], "clipfrac": []}
 
         for _ in range(self.config.optimization_epochs):
@@ -241,43 +268,48 @@ class PPOTrainer:
                 mb = perm[start : start + minibatch_size]
                 step_idx = mb // buffer.num_envs
                 env_idx = mb % buffer.num_envs
-                obs_mb = gather_obs(stacked_obs, static_obs_keys, env_idx, step_idx)
+                with self.profiler.record("update.gather_obs"):
+                    obs_mb = gather_obs(stacked_obs, static_obs_keys, env_idx, step_idx)
                 actions_mb = buffer.actions[step_idx, env_idx]
-                _, new_logprob, entropy, new_value = self._policy_forward(obs_mb, action=actions_mb)
+                with self.profiler.record("update.policy_forward"):
+                    _, new_logprob, entropy, new_value = self._policy_forward(obs_mb, action=actions_mb)
 
-                old_logprob = buffer.logprobs[step_idx, env_idx]
-                logratio = new_logprob.float() - old_logprob
-                ratio = logratio.exp()
-                mask = buffer.train_masks[step_idx, env_idx]
-                if not mask.any():
-                    continue
+                with self.profiler.record("update.loss"):
+                    old_logprob = buffer.logprobs[step_idx, env_idx]
+                    logratio = new_logprob.float() - old_logprob
+                    ratio = logratio.exp()
+                    mask = buffer.train_masks[step_idx, env_idx]
+                    if not mask.any():
+                        continue
 
-                mb_adv = advantages[step_idx, env_idx]
-                if self.config.norm_adv:
-                    mb_adv = (mb_adv - masked_mean(mb_adv, mask)) / (masked_std(mb_adv, mask) + 1e-8)
+                    mb_adv = advantages[step_idx, env_idx]
+                    if self.config.norm_adv:
+                        mb_adv = (mb_adv - masked_mean(mb_adv, mask)) / (masked_std(mb_adv, mask) + 1e-8)
 
-                pg_loss1 = -mb_adv * ratio
-                pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon)
-                policy_loss = masked_mean(torch.maximum(pg_loss1, pg_loss2), mask)
+                    pg_loss1 = -mb_adv * ratio
+                    pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon)
+                    policy_loss = masked_mean(torch.maximum(pg_loss1, pg_loss2), mask)
 
-                old_value = buffer.values[step_idx, env_idx]
-                target = returns[step_idx, env_idx]
-                new_value = new_value.float()
-                if self.config.clip_vloss:
-                    unclipped = (new_value - target).square()
-                    clipped_value = old_value + (new_value - old_value).clamp(-self.config.vf_clip_epsilon, self.config.vf_clip_epsilon)
-                    clipped = (clipped_value - target).square()
-                    value_loss = 0.5 * masked_mean(torch.maximum(unclipped, clipped), mask)
-                else:
-                    value_loss = 0.5 * masked_mean((new_value - target).square(), mask)
+                    old_value = buffer.values[step_idx, env_idx]
+                    target = returns[step_idx, env_idx]
+                    new_value = new_value.float()
+                    if self.config.clip_vloss:
+                        unclipped = (new_value - target).square()
+                        clipped_value = old_value + (new_value - old_value).clamp(-self.config.vf_clip_epsilon, self.config.vf_clip_epsilon)
+                        clipped = (clipped_value - target).square()
+                        value_loss = 0.5 * masked_mean(torch.maximum(unclipped, clipped), mask)
+                    else:
+                        value_loss = 0.5 * masked_mean((new_value - target).square(), mask)
 
-                entropy_loss = masked_mean(entropy.float(), mask)
-                loss = policy_loss - self.config.entropy_coeff * entropy_loss + self.config.value_coeff * value_loss
+                    entropy_loss = masked_mean(entropy.float(), mask)
+                    loss = policy_loss - self.config.entropy_coeff * entropy_loss + self.config.value_coeff * value_loss
 
                 self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+                with self.profiler.record("update.backward"):
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+                with self.profiler.record("update.optimizer_step"):
+                    self.optimizer.step()
 
                 with torch.no_grad():
                     sample_kl = (ratio - 1.0) - logratio
@@ -296,6 +328,7 @@ class PPOTrainer:
         return {k: float(sum(v) / max(len(v), 1)) for k, v in metrics.items()}
 
     def train_one_update(self, batch: dict[str, Any], sampling_method: str = "sample") -> dict[str, float]:
+        self.profiler.reset()
         self._sync_timing()
         t0 = time.perf_counter()
         buffer, next_obs, next_done, rollout_metrics = self.collect_rollout(batch, sampling_method=sampling_method)
@@ -313,4 +346,6 @@ class PPOTrainer:
         metrics["rollout_seconds"] = t1 - t0
         metrics["gae_seconds"] = t2 - t1
         metrics["update_seconds"] = t3 - t2
+        if self.config.profile:
+            metrics.update(self.profiler.metrics())
         return metrics

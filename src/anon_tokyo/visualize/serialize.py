@@ -378,7 +378,7 @@ def serialize_simulation_batch(
                 track_valid = valid[agent_idx]
                 if not bool(track_valid.any()) and not bool(controlled[agent_idx].item()):
                     continue
-                keep = torch.ones_like(track_valid, dtype=torch.bool) if bool(controlled[agent_idx].item()) else track_valid
+                keep = torch.ones_like(track_valid, dtype=torch.bool)
                 pts = positions[agent_idx, keep]
                 record = {
                     "agent_id": int(agent_idx),

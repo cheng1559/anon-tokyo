@@ -21,6 +21,7 @@ from anon_tokyo.visualize.serialize import (
 )
 
 SPLITS = ("training", "validation", "testing")
+SIMULATION_CONTROL_MODES = ("tracks_to_predict", "sdc", "ego", "non_reactive", "all_agents", "all")
 
 
 def _import_class(path: str):
@@ -58,6 +59,7 @@ class WebVisualizerService:
         checkpoint_path: str | None = None,
         split: str | None = None,
         batch_size: int = 4,
+        simulation_control_mode: str | None = None,
     ) -> None:
         self.task = task
         self.config_path = config_path
@@ -66,6 +68,9 @@ class WebVisualizerService:
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.cfg = _load_yaml(config_path)
+        self.simulation_control_mode = self._validate_simulation_control_mode(
+            simulation_control_mode or self._default_simulation_control_mode()
+        )
         self.dataset = self._build_display_dataset()
         self.inference_dataset = self._build_inference_dataset()
         self.inference_transform = self._data_transform(self.inference_dataset)
@@ -82,6 +87,7 @@ class WebVisualizerService:
             checkpoint_path=os.environ.get("ANON_TOKYO_VIS_CHECKPOINT") or None,
             split=os.environ.get("ANON_TOKYO_VIS_SPLIT") or None,
             batch_size=int(os.environ.get("ANON_TOKYO_VIS_BATCH_SIZE", "4")),
+            simulation_control_mode=os.environ.get("ANON_TOKYO_VIS_SIMULATION_CONTROL_MODE") or None,
         )
 
     def initialize_env(self, **payload: Any) -> dict[str, Any]:
@@ -94,6 +100,10 @@ class WebVisualizerService:
         self.batch_size = int(payload.get("batch_size", self.batch_size))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.cfg = _load_yaml(self.config_path)
+        control_mode = payload.get("simulation_control_mode", payload.get("control_mode"))
+        self.simulation_control_mode = self._validate_simulation_control_mode(
+            control_mode or self._default_simulation_control_mode()
+        )
         self.dataset = self._build_display_dataset()
         self.inference_dataset = self._build_inference_dataset()
         self.inference_transform = self._data_transform(self.inference_dataset)
@@ -111,6 +121,7 @@ class WebVisualizerService:
             "split": self.split or self._default_split(),
             "batch_size": self.batch_size,
             "dataset_size": len(self.dataset),
+            "simulation_control_mode": self.simulation_control_mode,
         }
 
     def fetch_files(self) -> dict[str, list[str]]:
@@ -156,6 +167,15 @@ class WebVisualizerService:
             return self.cfg.get("data", {}).get("split", "training")
         return "validation"
 
+    def _default_simulation_control_mode(self) -> str:
+        return self.cfg.get("data", {}).get("simulation_control_mode", "tracks_to_predict")
+
+    def _validate_simulation_control_mode(self, value: Any) -> str:
+        mode = str(value)
+        if mode not in SIMULATION_CONTROL_MODES:
+            raise ValueError(f"simulation_control_mode must be one of {SIMULATION_CONTROL_MODES}, got {mode!r}")
+        return mode
+
     def _list_files(self, root: str, suffixes: set[str], limit: int = 300) -> list[str]:
         root_path = Path(root)
         if not root_path.exists():
@@ -179,6 +199,7 @@ class WebVisualizerService:
             data_cfg["include_eval_meta"] = True
         elif self.task == "simulation":
             data_cfg["transform"] = "simulation"
+            data_cfg["simulation_control_mode"] = self.simulation_control_mode
         else:
             raise ValueError(f"Unsupported task: {self.task}")
         return WOMDDataset(split=split, **data_cfg)

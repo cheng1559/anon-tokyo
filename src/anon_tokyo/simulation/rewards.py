@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
+from anon_tokyo.simulation.profiling import TimingProfiler
+
 
 ROAD_EDGE_TYPES = (15, 16)
-SOLID_LINE_TYPES = (7, 8, 11, 12)
-BOUNDARY_TYPES = ROAD_EDGE_TYPES + SOLID_LINE_TYPES
 
 
 @dataclass
@@ -107,7 +108,19 @@ def _batched_point_segment_distance(points: Tensor, start: Tensor, end: Tensor, 
     return dist.masked_fill(~seg_valid[:, None], float("inf"))
 
 
-def offroad_reward(polygons: Tensor, valid: Tensor, controlled: Tensor, map_polylines: Tensor, map_mask: Tensor, cfg: RewardConfig):
+def _profile(profiler: TimingProfiler | None, name: str):
+    return profiler.record(name) if profiler is not None else nullcontext()
+
+
+def offroad_reward(
+    polygons: Tensor,
+    valid: Tensor,
+    controlled: Tensor,
+    map_polylines: Tensor,
+    map_mask: Tensor,
+    cfg: RewardConfig,
+    profiler: TimingProfiler | None = None,
+):
     B, A = valid.shape
     out = torch.zeros(B, A, dtype=torch.bool, device=valid.device)
     active = controlled & valid
@@ -115,24 +128,26 @@ def offroad_reward(polygons: Tensor, valid: Tensor, controlled: Tensor, map_poly
     if batch_idx.numel() == 0:
         return out.float() * cfg.offroad_reward_weight, out
 
-    types = map_polylines[..., 6].round().long()
-    boundary_values = torch.tensor(BOUNDARY_TYPES, dtype=types.dtype, device=types.device)
-    boundary_type = torch.isin(types, boundary_values)
-    point_mask = map_mask.bool() & boundary_type
-    seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
-    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
-    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+    with _profile(profiler, "reward.offroad.prepare_map"):
+        types = map_polylines[..., 6].round().long()
+        boundary_values = torch.tensor(ROAD_EDGE_TYPES, dtype=types.dtype, device=types.device)
+        boundary_type = torch.isin(types, boundary_values)
+        point_mask = map_mask.bool() & boundary_type
+        seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
+        starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
+        ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
 
-    agent_polys = polygons[batch_idx, agent_idx]
-    agent_points = torch.cat((agent_polys, agent_polys.mean(dim=1, keepdim=True)), dim=1)
-    dist = _batched_point_segment_distance(
-        agent_points,
-        starts[batch_idx],
-        ends[batch_idx],
-        seg_valid[batch_idx],
-    )
-    min_dist = dist.amin(dim=2).amin(dim=1)
-    out[batch_idx, agent_idx] = min_dist <= cfg.offroad_distance_threshold
+    with _profile(profiler, "reward.offroad.distance"):
+        agent_polys = polygons[batch_idx, agent_idx]
+        agent_points = torch.cat((agent_polys, agent_polys.mean(dim=1, keepdim=True)), dim=1)
+        dist = _batched_point_segment_distance(
+            agent_points,
+            starts[batch_idx],
+            ends[batch_idx],
+            seg_valid[batch_idx],
+        )
+        min_dist = dist.amin(dim=2).amin(dim=1)
+        out[batch_idx, agent_idx] = min_dist <= cfg.offroad_distance_threshold
 
     reward = out.float() * cfg.offroad_reward_weight
     return reward, out
@@ -180,36 +195,49 @@ def comfort_reward(a_long: Tensor, a_lat: Tensor, jerk_long: Tensor, jerk_lat: T
     return torch.where(controlled & valid, score, torch.ones_like(score))
 
 
-def compute_rewards(state: dict[str, Tensor], cfg: RewardConfig) -> tuple[Tensor, Tensor, dict[str, Tensor], Tensor]:
+def compute_rewards(
+    state: dict[str, Tensor],
+    cfg: RewardConfig,
+    profiler: TimingProfiler | None = None,
+) -> tuple[Tensor, Tensor, dict[str, Tensor], Tensor]:
     """Compute combined reward, done flags, component info, and next goal flags."""
     valid = state["valid_mask"].bool()
     controlled = state["controlled_mask"].bool()
-    collision_r, collision, pair_collision, polygons = collision_reward(
-        state["positions"], state["headings"], state["sizes"], valid, controlled, cfg
-    )
-    offroad_r, offroad = offroad_reward(
-        polygons,
-        valid,
-        controlled,
-        state["map_polylines"],
-        state["map_polylines_mask"],
-        cfg,
-    )
-    ttc_score, ttc_alert, ttc = ttc_reward(state["positions"], state["velocities"], state["sizes"], valid, controlled, cfg)
-    goal_r, goal_first, next_goal_reached, goal_dist = goal_reaching_reward(
-        state["positions"], state["goal_positions"], state["goal_reached"], controlled, valid, cfg
-    )
-    comfort_score = comfort_reward(
-        state["a_long"], state["a_lat"], state["jerk_long"], state["jerk_lat"], controlled, valid, cfg
-    )
+    with _profile(profiler, "reward.collision"):
+        collision_r, collision, pair_collision, polygons = collision_reward(
+            state["positions"], state["headings"], state["sizes"], valid, controlled, cfg
+        )
+    with _profile(profiler, "reward.offroad"):
+        offroad_r, offroad = offroad_reward(
+            polygons,
+            valid,
+            controlled,
+            state["map_polylines"],
+            state["map_polylines_mask"],
+            cfg,
+            profiler=profiler,
+        )
+    with _profile(profiler, "reward.ttc"):
+        ttc_score, ttc_alert, ttc = ttc_reward(
+            state["positions"], state["velocities"], state["sizes"], valid, controlled, cfg
+        )
+    with _profile(profiler, "reward.goal"):
+        goal_r, goal_first, next_goal_reached, goal_dist = goal_reaching_reward(
+            state["positions"], state["goal_positions"], state["goal_reached"], controlled, valid, cfg
+        )
+    with _profile(profiler, "reward.comfort"):
+        comfort_score = comfort_reward(
+            state["a_long"], state["a_lat"], state["jerk_long"], state["jerk_lat"], controlled, valid, cfg
+        )
 
-    hard_reward = collision_r + offroad_r
-    done = (collision | offroad) & controlled & valid
+    with _profile(profiler, "reward.combine"):
+        hard_reward = collision_r + offroad_r
+        done = (collision | offroad) & controlled & valid
 
-    soft_score = comfort_score * ttc_score
-    alive = (~done).float()
-    total_reward = hard_reward + alive * (goal_r + soft_score / max(cfg.num_steps, 1))
-    total_reward = torch.where(controlled & valid, total_reward, torch.zeros_like(total_reward))
+        soft_score = comfort_score * ttc_score
+        alive = (~done).float()
+        total_reward = hard_reward + alive * (goal_r + soft_score / max(cfg.num_steps, 1))
+        total_reward = torch.where(controlled & valid, total_reward, torch.zeros_like(total_reward))
 
     info = {
         "collision": collision,

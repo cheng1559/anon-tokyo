@@ -120,7 +120,7 @@ function resetView() {
     agent.history.forEach((point) => points.push(point))
     agent.future.forEach((point) => points.push(point))
   })
-  scenario.rollout?.forEach((track) => track.points.forEach((point) => points.push(point)))
+  scenario.rollout?.forEach((track) => validTrackPoints(track).forEach((point) => points.push(point)))
   if (points.length === 0) return
 
   const xs = points.map((point) => point[0] ?? 0)
@@ -268,9 +268,40 @@ function isSelectedAgent(agentId: number) {
   return props.selectedAgentId === null || props.selectedAgentId === undefined || props.selectedAgentId === agentId
 }
 
+function isFinitePoint(point: number[] | undefined): point is number[] {
+  return point !== undefined && Number.isFinite(point[0]) && Number.isFinite(point[1])
+}
+
+function isTrackFrameValid(track: RolloutTrack | undefined, frame: number) {
+  if (!track || frame < 0 || frame >= track.points.length) return false
+  if (!isFinitePoint(track.points[frame])) return false
+  if (!track.valid?.length) return true
+  return Boolean(track.valid[frame])
+}
+
+function validTrackPoints(track: RolloutTrack) {
+  return track.points.filter((_, index) => isTrackFrameValid(track, index))
+}
+
+function validRolloutSegments(track: RolloutTrack, frame: number) {
+  const segments: number[][][] = []
+  let segment: number[][] = []
+  const end = Math.min(frame, track.points.length - 1)
+  for (let index = 0; index <= end; index++) {
+    if (isTrackFrameValid(track, index)) {
+      segment.push(track.points[index]!)
+      continue
+    }
+    if (segment.length) segments.push(segment)
+    segment = []
+  }
+  if (segment.length) segments.push(segment)
+  return segments
+}
+
 function rolloutState(track: RolloutTrack | undefined, frame: number) {
-  if (!track || track.points.length === 0) return null
-  const idx = Math.max(0, Math.min(frame, track.points.length - 1))
+  if (!track || !isTrackFrameValid(track, frame)) return null
+  const idx = frame
   return {
     position: track.points[idx]!,
     heading: track.headings?.[idx],
@@ -360,10 +391,11 @@ function drawPredictions(ctx: CanvasRenderingContext2D, scenario: Scenario, them
     }
   })
   scenario.rollout?.filter((track) => isSelectedAgent(track.agent_id)).forEach((track) => {
-    const points = track.points.slice(0, Math.max(2, props.frame + 1))
-    drawWorldLine(ctx, points, theme.rollout, 2.6, 0.88)
-    const last = points[points.length - 1]
-    if (last) drawWorldCircle(ctx, last, theme.rollout, 4.5 / zoomLevel.value)
+    validRolloutSegments(track, props.frame).forEach((points) => {
+      drawWorldLine(ctx, points, theme.rollout, 2.6, 0.88)
+    })
+    const state = rolloutState(track, props.frame)
+    if (state) drawWorldCircle(ctx, state.position, theme.rollout, 4.5 / zoomLevel.value)
   })
 }
 
@@ -428,11 +460,13 @@ function draw() {
     })
   scenario.agents.forEach((agent) => {
     const track = rolloutByAgent.get(agent.id)
+    const state = rolloutState(track, props.frame)
+    if (track && !state) return
     drawAgentBox(
       ctx,
       agent,
       theme,
-      rolloutState(track, props.frame),
+      state,
       isGoalReached(track, props.frame),
       hasCollision(track, props.frame),
       hasOffroad(track, props.frame)

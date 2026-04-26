@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -88,6 +90,10 @@ def _ensure_tokens(mask: Tensor) -> Tensor:
     if empty.any():
         safe[empty, 0] = True
     return safe
+
+
+def _profile(profiler, name: str):
+    return profiler.record(name) if profiler is not None else nullcontext()
 
 
 class _InteractionLayer(nn.Module):
@@ -518,24 +524,24 @@ class AgentCentricEncoder(nn.Module):
         return torch.cat((local_goal, dist, direction), dim=-1)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        agent_pos = batch["obj_positions"]
-        agent_mask = batch["agent_mask"].bool()
-        map_center = batch["map_polylines_center"]
-        map_mask = batch["map_mask"].bool()
-        B, A, _ = agent_pos.shape
+        profiler = getattr(self, "_profiler", None)
+        with _profile(profiler, "encoder.prepare"):
+            agent_pos = batch["obj_positions"]
+            agent_mask = batch["agent_mask"].bool()
+            map_center = batch["map_polylines_center"]
+            map_mask = batch["map_mask"].bool()
+            B, A, _ = agent_pos.shape
 
-        controlled_mask = batch.get("controlled_mask")
-        if controlled_mask is None:
-            ego_mask = agent_mask
-        else:
-            ego_mask = controlled_mask.to(device=agent_pos.device).bool() & agent_mask
+            controlled_mask = batch.get("controlled_mask")
+            if controlled_mask is None:
+                ego_mask = agent_mask
+            else:
+                ego_mask = controlled_mask.to(device=agent_pos.device).bool() & agent_mask
 
-        query_batch_idx, query_agent_idx = ego_mask.nonzero(as_tuple=True)
-        K = min(self.max_context_agents, A)
-        L = min(self.max_context_maps, map_center.shape[1])
-        context_agent_indices = torch.zeros(B, A, self.max_context_agents, dtype=torch.long, device=agent_pos.device)
-        context_map_indices = torch.zeros(B, A, self.max_context_maps, dtype=torch.long, device=agent_pos.device)
-        ego_feature = agent_pos.new_zeros(B, A, self.d_model)
+            query_batch_idx, query_agent_idx = ego_mask.nonzero(as_tuple=True)
+            context_agent_indices = torch.zeros(B, A, self.max_context_agents, dtype=torch.long, device=agent_pos.device)
+            context_map_indices = torch.zeros(B, A, self.max_context_maps, dtype=torch.long, device=agent_pos.device)
+            ego_feature = agent_pos.new_zeros(B, A, self.d_model)
         if query_batch_idx.numel() == 0:
             return {
                 "ego_feature": ego_feature,
@@ -544,59 +550,67 @@ class AgentCentricEncoder(nn.Module):
                 "context_map_indices": context_map_indices,
             }
 
-        agent_idx, agent_selected = _nearest_agent_indices_for_queries(
-            query_batch_idx,
-            query_agent_idx,
-            agent_pos,
-            agent_mask,
-            self.max_context_agents,
-        )
-        map_idx, map_selected = _nearest_map_indices_for_queries(
-            query_batch_idx,
-            query_agent_idx,
-            agent_pos,
-            map_center,
-            map_mask,
-            self.max_context_maps,
-        )
+        with _profile(profiler, "encoder.nearest_agents"):
+            agent_idx, agent_selected = _nearest_agent_indices_for_queries(
+                query_batch_idx,
+                query_agent_idx,
+                agent_pos,
+                agent_mask,
+                self.max_context_agents,
+            )
+        with _profile(profiler, "encoder.nearest_maps"):
+            map_idx, map_selected = _nearest_map_indices_for_queries(
+                query_batch_idx,
+                query_agent_idx,
+                agent_pos,
+                map_center,
+                map_mask,
+                self.max_context_maps,
+            )
 
-        agent_points, agent_point_mask, agent_token_pos, agent_token_mask = self._agent_features(
-            batch, query_batch_idx, query_agent_idx, agent_idx, agent_selected
-        )
-        map_token_features, map_token_pos, map_token_mask = self._map_features(
-            batch, query_batch_idx, query_agent_idx, map_idx, map_selected
-        )
+        with _profile(profiler, "encoder.agent_features"):
+            agent_points, agent_point_mask, agent_token_pos, agent_token_mask = self._agent_features(
+                batch, query_batch_idx, query_agent_idx, agent_idx, agent_selected
+            )
+        with _profile(profiler, "encoder.map_features"):
+            map_token_features, map_token_pos, map_token_mask = self._map_features(
+                batch, query_batch_idx, query_agent_idx, map_idx, map_selected
+            )
 
         K = agent_points.shape[1]
         L = map_token_features.shape[1]
 
-        agent_input = torch.cat((agent_points, agent_point_mask.unsqueeze(-1).to(dtype=agent_points.dtype)), dim=-1)
-        agent_feat = self.agent_polyline_encoder(agent_input, _ensure_points(agent_point_mask))
-        agent_feat = agent_feat.masked_fill(~agent_token_mask[..., None], 0.0)
-
-        map_feat = self.map_token_encoder(map_token_features)
-        map_feat = map_feat.masked_fill(~map_token_mask[..., None], 0.0)
-
-        safe_agent_token_mask = _ensure_tokens(agent_token_mask)
-        safe_map_token_mask = _ensure_tokens(map_token_mask)
-        for layer in self.layers:
-            agent_feat, map_feat = layer(
-                agent_feat,
-                map_feat,
-                agent_token_pos,
-                map_token_pos,
-                safe_agent_token_mask,
-                safe_map_token_mask,
-            )
+        with _profile(profiler, "encoder.agent_pointnet"):
+            agent_input = torch.cat((agent_points, agent_point_mask.unsqueeze(-1).to(dtype=agent_points.dtype)), dim=-1)
+            agent_feat = self.agent_polyline_encoder(agent_input, _ensure_points(agent_point_mask))
             agent_feat = agent_feat.masked_fill(~agent_token_mask[..., None], 0.0)
+
+        with _profile(profiler, "encoder.map_token_mlp"):
+            map_feat = self.map_token_encoder(map_token_features)
             map_feat = map_feat.masked_fill(~map_token_mask[..., None], 0.0)
 
-        ego_feature_query = agent_feat[:, 0]
-        goal_feature = self.goal_encoder(self._goal_features(batch, query_batch_idx, query_agent_idx))
-        ego_feature_query = self.out_norm(ego_feature_query + goal_feature)
-        ego_feature[query_batch_idx, query_agent_idx] = ego_feature_query
-        context_agent_indices[query_batch_idx, query_agent_idx, :K] = agent_idx[:, :K]
-        context_map_indices[query_batch_idx, query_agent_idx, :L] = map_idx[:, :L]
+        with _profile(profiler, "encoder.interaction_layers"):
+            safe_agent_token_mask = _ensure_tokens(agent_token_mask)
+            safe_map_token_mask = _ensure_tokens(map_token_mask)
+            for layer in self.layers:
+                agent_feat, map_feat = layer(
+                    agent_feat,
+                    map_feat,
+                    agent_token_pos,
+                    map_token_pos,
+                    safe_agent_token_mask,
+                    safe_map_token_mask,
+                )
+                agent_feat = agent_feat.masked_fill(~agent_token_mask[..., None], 0.0)
+                map_feat = map_feat.masked_fill(~map_token_mask[..., None], 0.0)
+
+        with _profile(profiler, "encoder.output"):
+            ego_feature_query = agent_feat[:, 0]
+            goal_feature = self.goal_encoder(self._goal_features(batch, query_batch_idx, query_agent_idx))
+            ego_feature_query = self.out_norm(ego_feature_query + goal_feature)
+            ego_feature[query_batch_idx, query_agent_idx] = ego_feature_query
+            context_agent_indices[query_batch_idx, query_agent_idx, :K] = agent_idx[:, :K]
+            context_map_indices[query_batch_idx, query_agent_idx, :L] = map_idx[:, :L]
 
         return {
             "ego_feature": ego_feature,

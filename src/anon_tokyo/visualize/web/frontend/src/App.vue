@@ -39,6 +39,7 @@ const task = ref('prediction')
 const configPath = ref('configs/prediction/anon_tokyo.yaml')
 const checkpointPath = ref('None')
 const split = ref('validation')
+const simulationControlMode = ref('tracks_to_predict')
 const batchSize = ref(4)
 const frame = ref(0)
 const frameSlider = computed({
@@ -66,6 +67,13 @@ const configOptions = computed(() => {
     if (!files.value) return []
     return task.value === 'simulation' ? files.value.simulation_configs : files.value.prediction_configs
 })
+const simulationControlModeOptions = [
+    { value: 'tracks_to_predict', label: 'Tracks to Predict' },
+    { value: 'sdc', label: 'SDC' },
+    { value: 'ego', label: 'Ego' },
+    { value: 'non_reactive', label: 'Non Reactive' },
+    { value: 'all_agents', label: 'All Agents' }
+]
 
 const currentScenario = computed(() => batch.value?.scenarios[worldIndex.value] ?? null)
 const selectedAgentValue = computed({
@@ -212,14 +220,17 @@ async function initialize() {
     isLoading.value = true
     const ckpt = checkpointPath.value === 'None' ? 'none' : checkpointPath.value
     try {
-        logStatus('INFO', `Initialize ${task.value} env, config=${configPath.value}, ckpt=${ckpt}`)
+        const modeText = task.value === 'simulation' ? `, control=${simulationControlMode.value}` : ''
+        logStatus('INFO', `Initialize ${task.value} env, config=${configPath.value}, ckpt=${ckpt}${modeText}`)
         env.value = await initializeEnv({
             task: task.value,
             config_path: configPath.value,
             checkpoint_path: checkpointPath.value === 'None' ? null : checkpointPath.value,
             split: split.value,
-            batch_size: batchSize.value
+            batch_size: batchSize.value,
+            simulation_control_mode: task.value === 'simulation' ? simulationControlMode.value : undefined
         })
+        simulationControlMode.value = env.value.simulation_control_mode ?? simulationControlMode.value
         batchIndex.value = 0
         await loadBatch()
         logStatus('SUCCESS', 'Environment loaded')
@@ -338,6 +349,7 @@ onMounted(async () => {
         checkpointPath.value = env.value.checkpoint_path ?? 'None'
         split.value = env.value.split
         batchSize.value = env.value.batch_size
+        simulationControlMode.value = env.value.simulation_control_mode ?? simulationControlMode.value
         await loadBatch()
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
@@ -455,6 +467,20 @@ onBeforeUnmount(() => {
                                         <SelectContent>
                                             <SelectItem v-for="path in configOptions" :key="path" :value="path">
                                                 {{ path }}
+                                            </SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+
+                                <div v-if="task === 'simulation'">
+                                    <Label class="text-muted-foreground mb-1.5 block text-sm font-medium">Simulation Control</Label>
+                                    <Select v-model="simulationControlMode">
+                                        <SelectTrigger class="w-full">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem v-for="option in simulationControlModeOptions" :key="option.value" :value="option.value">
+                                                {{ option.label }}
                                             </SelectItem>
                                         </SelectContent>
                                     </Select>

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch.nn as nn
 from torch import Tensor
 
@@ -50,8 +52,18 @@ class AgentCentricModel(nn.Module):
         action: Tensor | None = None,
         sampling_method: str | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        encoded = self.encoder(obs)
-        return self.policy_head(encoded["ego_feature"], encoded["ego_mask"], action=action, sampling_method=sampling_method)
+        profiler = getattr(self, "_profiler", None)
+        encoder_timer = profiler.record("policy.encoder") if profiler is not None else nullcontext()
+        head_timer = profiler.record("policy.head") if profiler is not None else nullcontext()
+        with encoder_timer:
+            encoded = self.encoder(obs)
+        with head_timer:
+            return self.policy_head(
+                encoded["ego_feature"],
+                encoded["ego_mask"],
+                action=action,
+                sampling_method=sampling_method,
+            )
 
 
 AgentCentricPolicy = AgentCentricModel
