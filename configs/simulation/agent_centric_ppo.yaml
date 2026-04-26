@@ -4,12 +4,12 @@ seed_everything: 42
 model:
   class_path: anon_tokyo.simulation.agent_centric.model.AgentCentricModel
   init_args:
-    d_model: 128
+    d_model: 256
     num_layers: 2
     num_heads: 4
     sparse_k: 16
     dropout: 0.1
-    max_context_agents: 32
+    max_context_agents: 16
     max_context_maps: 128
     use_map_self_attention: false
     action_low: [-5.0, -1.0]
@@ -18,7 +18,7 @@ model:
 data:
   data_root: data/shards
   split: training
-  batch_size: 1024
+  batch_size: 2048
   num_workers: 4
   max_agents: 64
   max_polylines: 128
@@ -57,9 +57,10 @@ env:
 
 ppo:
   learning_rate: 3.0e-4
-  num_updates: 1500
+  num_updates: null
+  total_epochs: 300
   num_steps: 80
-  minibatch_size: 10240
+  minibatch_size: 20480
   optimization_epochs: 4
   clip_epsilon: 0.2
   gamma: 0.99

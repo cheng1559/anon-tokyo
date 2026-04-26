@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import time
 from typing import Any
 
 import torch
@@ -27,7 +28,8 @@ _DROP_FROM_POLICY_BUFFER_WHEN_TOKENIZED = {
 @dataclass
 class PPOConfig:
     num_steps: int = 80
-    num_updates: int = 1500
+    num_updates: int | None = 1500
+    total_epochs: int | None = None
     learning_rate: float = 3.0e-4
     minibatch_size: int | None = None
     optimization_epochs: int = 4
@@ -58,29 +60,39 @@ def masked_std(x: Tensor, mask: Tensor, eps: float = 1e-8) -> Tensor:
     return torch.sqrt(masked_mean((x - mean).square(), mask, eps).clamp_min(0.0))
 
 
-def _slice_obs_env(obs: dict[str, Any], env_idx: int) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in obs.items():
-        if isinstance(value, Tensor):
-            out[key] = value[env_idx]
-        elif isinstance(value, list):
-            out[key] = value[env_idx]
-        else:
-            out[key] = value
-    return out
+def _same_storage(values: list[Tensor]) -> bool:
+    first = values[0]
+    first_ptr = first.untyped_storage().data_ptr()
+    return all(value.shape == first.shape and value.untyped_storage().data_ptr() == first_ptr for value in values[1:])
 
 
-def gather_obs(obs_steps: list[dict[str, Any]], env_indices: Tensor, step_indices: Tensor) -> dict[str, Any]:
-    """Gather a minibatch of observations by rollout step and environment index."""
-    samples = [_slice_obs_env(obs_steps[int(s.item())], int(e.item())) for e, s in zip(env_indices, step_indices)]
-    out: dict[str, Any] = {}
-    for key in samples[0]:
-        vals = [sample[key] for sample in samples]
-        if isinstance(vals[0], Tensor):
-            out[key] = torch.stack(vals)
+def stack_obs_steps(obs_steps: list[dict[str, Any]]) -> tuple[dict[str, Tensor], set[str]]:
+    """Stack dynamic rollout observations and keep static tensors unstacked."""
+    out: dict[str, Tensor] = {}
+    static_keys: set[str] = set()
+    for key in obs_steps[0]:
+        values = [obs[key] for obs in obs_steps]
+        if not isinstance(values[0], Tensor):
+            raise TypeError(f"Rollout observation {key!r} is not a tensor")
+        if _same_storage(values):
+            out[key] = values[0]
+            static_keys.add(key)
         else:
-            out[key] = vals
-    return out
+            out[key] = torch.stack(values, dim=0)
+    return out, static_keys
+
+
+def gather_obs(
+    stacked_obs: dict[str, Tensor],
+    static_keys: set[str],
+    env_indices: Tensor,
+    step_indices: Tensor,
+) -> dict[str, Tensor]:
+    """Gather a PPO minibatch from stacked ``[T, B, ...]`` observations."""
+    return {
+        key: value[env_indices] if key in static_keys else value[step_indices, env_indices]
+        for key, value in stacked_obs.items()
+    }
 
 
 class RolloutBuffer:
@@ -145,6 +157,10 @@ class PPOTrainer:
     def _autocast_enabled(self) -> bool:
         return self.config.use_bf16 and self.env.device.type == "cuda"
 
+    def _sync_timing(self) -> None:
+        if self.env.device.type == "cuda":
+            torch.cuda.synchronize(self.env.device)
+
     def _policy_forward(
         self,
         obs: dict[str, Any],
@@ -198,6 +214,7 @@ class PPOTrainer:
         total_samples = buffer.size * buffer.num_envs
         minibatch_size = self.config.minibatch_size or total_samples
         flat_indices = torch.arange(total_samples, device=self.env.device)
+        stacked_obs, static_obs_keys = stack_obs_steps(buffer.obs)
         metrics: dict[str, list[float]] = {"policy_loss": [], "value_loss": [], "entropy": [], "approx_kl": [], "clipfrac": []}
 
         for _ in range(self.config.optimization_epochs):
@@ -207,7 +224,7 @@ class PPOTrainer:
                 mb = perm[start : start + minibatch_size]
                 step_idx = mb // buffer.num_envs
                 env_idx = mb % buffer.num_envs
-                obs_mb = gather_obs(buffer.obs, env_idx, step_idx)
+                obs_mb = gather_obs(stacked_obs, static_obs_keys, env_idx, step_idx)
                 actions_mb = buffer.actions[step_idx, env_idx]
                 _, new_logprob, entropy, new_value = self._policy_forward(obs_mb, action=actions_mb)
 
@@ -262,9 +279,20 @@ class PPOTrainer:
         return {k: float(sum(v) / max(len(v), 1)) for k, v in metrics.items()}
 
     def train_one_update(self, batch: dict[str, Any], sampling_method: str = "sample") -> dict[str, float]:
+        self._sync_timing()
+        t0 = time.perf_counter()
         buffer, next_obs, next_done = self.collect_rollout(batch, sampling_method=sampling_method)
+        self._sync_timing()
+        t1 = time.perf_counter()
         returns, advantages = self.estimate_returns_and_advantages(buffer, next_obs, next_done)
+        self._sync_timing()
+        t2 = time.perf_counter()
         metrics = self.update(buffer, returns, advantages)
+        self._sync_timing()
+        t3 = time.perf_counter()
         valid_mask = buffer.train_masks
         metrics["mean_reward"] = float(masked_mean(buffer.rewards, valid_mask).detach().cpu()) if valid_mask.any() else 0.0
+        metrics["rollout_seconds"] = t1 - t0
+        metrics["gae_seconds"] = t2 - t1
+        metrics["update_seconds"] = t3 - t2
         return metrics

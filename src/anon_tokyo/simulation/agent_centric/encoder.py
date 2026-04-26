@@ -166,35 +166,70 @@ class _InteractionLayer(nn.Module):
             map_feat = self.mm_ffn_norm(map_feat + self.drop(self.mm_ffn(map_feat)))
             map_feat = map_feat.masked_fill(~map_mask[..., None], 0.0)
 
-        aa_topk = select_topk(agent_pos, agent_pos, agent_mask, self.aa_attn.sparse_k)
+        if self.use_map_self_attention:
+            aa_topk = select_topk(agent_pos, agent_pos, agent_mask, self.aa_attn.sparse_k)
+            aa = self.aa_attn(
+                agent_feat,
+                agent_feat,
+                agent_pos,
+                agent_pos,
+                zero_agent_heading,
+                zero_agent_heading,
+                agent_mask,
+                aa_topk,
+            )
+            agent_feat = self.aa_norm(agent_feat + self.drop(aa))
+            agent_feat = self.aa_ffn_norm(agent_feat + self.drop(self.aa_ffn(agent_feat)))
+            agent_feat = agent_feat.masked_fill(~agent_mask[..., None], 0.0)
+
+            am_topk = select_topk(agent_pos, map_pos, map_mask, self.am_attn.sparse_k)
+            am = self.am_attn(
+                agent_feat,
+                map_feat,
+                agent_pos,
+                map_pos,
+                zero_agent_heading,
+                zero_map_heading,
+                map_mask,
+                am_topk,
+            )
+            agent_feat = self.am_norm(agent_feat + self.drop(am))
+            agent_feat = self.am_ffn_norm(agent_feat + self.drop(self.am_ffn(agent_feat)))
+            agent_feat = agent_feat.masked_fill(~agent_mask[..., None], 0.0)
+            return agent_feat, map_feat
+
+        ego_feat = agent_feat[:, :1]
+        ego_pos = agent_pos[:, :1]
+        ego_heading = zero_agent_heading[:, :1]
+        aa_topk = select_topk(ego_pos, agent_pos, agent_mask, self.aa_attn.sparse_k)
         aa = self.aa_attn(
+            ego_feat,
             agent_feat,
-            agent_feat,
+            ego_pos,
             agent_pos,
-            agent_pos,
-            zero_agent_heading,
+            ego_heading,
             zero_agent_heading,
             agent_mask,
             aa_topk,
         )
-        agent_feat = self.aa_norm(agent_feat + self.drop(aa))
-        agent_feat = self.aa_ffn_norm(agent_feat + self.drop(self.aa_ffn(agent_feat)))
-        agent_feat = agent_feat.masked_fill(~agent_mask[..., None], 0.0)
+        ego_feat = self.aa_norm(ego_feat + self.drop(aa))
+        ego_feat = self.aa_ffn_norm(ego_feat + self.drop(self.aa_ffn(ego_feat)))
 
-        am_topk = select_topk(agent_pos, map_pos, map_mask, self.am_attn.sparse_k)
+        am_topk = select_topk(ego_pos, map_pos, map_mask, self.am_attn.sparse_k)
         am = self.am_attn(
-            agent_feat,
+            ego_feat,
             map_feat,
-            agent_pos,
+            ego_pos,
             map_pos,
-            zero_agent_heading,
+            ego_heading,
             zero_map_heading,
             map_mask,
             am_topk,
         )
-        agent_feat = self.am_norm(agent_feat + self.drop(am))
-        agent_feat = self.am_ffn_norm(agent_feat + self.drop(self.am_ffn(agent_feat)))
-        agent_feat = agent_feat.masked_fill(~agent_mask[..., None], 0.0)
+        ego_feat = self.am_norm(ego_feat + self.drop(am))
+        ego_feat = self.am_ffn_norm(ego_feat + self.drop(self.am_ffn(ego_feat)))
+        agent_feat = agent_feat.clone()
+        agent_feat[:, :1] = ego_feat.masked_fill(~agent_mask[:, :1, None], 0.0)
         return agent_feat, map_feat
 
 

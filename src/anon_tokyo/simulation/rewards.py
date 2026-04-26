@@ -96,28 +96,43 @@ def _point_segment_distance(points: Tensor, start: Tensor, end: Tensor) -> Tenso
     return (points[:, None] - proj).norm(dim=-1)
 
 
+def _batched_point_segment_distance(points: Tensor, start: Tensor, end: Tensor, seg_valid: Tensor) -> Tensor:
+    """Distance from ``points [Q,N,2]`` to same-batch segments ``[Q,S,2]``."""
+    seg = end - start
+    rel = points[:, :, None] - start[:, None]
+    denom = (seg * seg).sum(dim=-1).clamp_min(1e-7)
+    u = ((rel * seg[:, None]).sum(dim=-1) / denom[:, None]).clamp(0.0, 1.0)
+    proj = start[:, None] + u[..., None] * seg[:, None]
+    dist = (points[:, :, None] - proj).norm(dim=-1)
+    return dist.masked_fill(~seg_valid[:, None], float("inf"))
+
+
 def offroad_reward(polygons: Tensor, valid: Tensor, controlled: Tensor, map_polylines: Tensor, map_mask: Tensor, cfg: RewardConfig):
     B, A = valid.shape
     out = torch.zeros(B, A, dtype=torch.bool, device=valid.device)
-    types = map_polylines[..., 6].round().long()
-    boundary_type = torch.zeros_like(types, dtype=torch.bool)
-    for type_code in BOUNDARY_TYPES:
-        boundary_type |= types == type_code
+    active = controlled & valid
+    batch_idx, agent_idx = active.nonzero(as_tuple=True)
+    if batch_idx.numel() == 0:
+        return out.float() * cfg.offroad_reward_weight, out
 
-    for b in range(B):
-        agent_idx = torch.where(controlled[b] & valid[b])[0]
-        if agent_idx.numel() == 0:
-            continue
-        point_mask = map_mask[b].bool() & boundary_type[b]
-        seg_mask = point_mask[:, :-1] & point_mask[:, 1:]
-        if not seg_mask.any():
-            continue
-        starts = map_polylines[b, :, :-1, 0:2][seg_mask]
-        ends = map_polylines[b, :, 1:, 0:2][seg_mask]
-        agent_points = torch.cat((polygons[b, agent_idx], polygons[b, agent_idx].mean(dim=1, keepdim=True)), dim=1)
-        flat_points = agent_points.reshape(-1, 2)
-        min_dist = _point_segment_distance(flat_points, starts, ends).amin(dim=1).view(agent_idx.numel(), -1).amin(dim=1)
-        out[b, agent_idx] = min_dist <= cfg.offroad_distance_threshold
+    types = map_polylines[..., 6].round().long()
+    boundary_values = torch.tensor(BOUNDARY_TYPES, dtype=types.dtype, device=types.device)
+    boundary_type = torch.isin(types, boundary_values)
+    point_mask = map_mask.bool() & boundary_type
+    seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
+    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
+    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+
+    agent_polys = polygons[batch_idx, agent_idx]
+    agent_points = torch.cat((agent_polys, agent_polys.mean(dim=1, keepdim=True)), dim=1)
+    dist = _batched_point_segment_distance(
+        agent_points,
+        starts[batch_idx],
+        ends[batch_idx],
+        seg_valid[batch_idx],
+    )
+    min_dist = dist.amin(dim=2).amin(dim=1)
+    out[batch_idx, agent_idx] = min_dist <= cfg.offroad_distance_threshold
 
     reward = out.float() * cfg.offroad_reward_weight
     return reward, out

@@ -71,26 +71,34 @@ class AgentCentricPolicyHead(nn.Module):
         action: Tensor | None = None,
         sampling_method: str | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        dist = self._distribution(features)
+        mask = mask.bool()
+        action_out = features.new_zeros(*features.shape[:-1], 2)
+        logprob_out = features.new_zeros(features.shape[:-1])
+        entropy_out = features.new_zeros(features.shape[:-1])
+        value_out = features.new_zeros(features.shape[:-1])
+        if not mask.any():
+            return action_out, logprob_out, entropy_out, value_out
+
+        packed_features = features[mask]
+        dist = self._distribution(packed_features)
         low = self.action_low.to(device=features.device, dtype=features.dtype)
         high = self.action_high.to(device=features.device, dtype=features.dtype)
         scale = (high - low).clamp_min(self.eps)
 
         if action is None:
             unit_action = self._unit_action(dist, sampling_method).clamp(self.eps, 1.0 - self.eps)
-            action = low + unit_action * scale
+            packed_action = low + unit_action * scale
         else:
-            action = action.to(device=features.device, dtype=features.dtype)
-            unit_action = ((action - low) / scale).clamp(self.eps, 1.0 - self.eps)
+            packed_action = action.to(device=features.device, dtype=features.dtype)[mask]
+            unit_action = ((packed_action - low) / scale).clamp(self.eps, 1.0 - self.eps)
 
         log_scale = scale.log().sum()
         logprob = dist.log_prob(unit_action).sum(dim=-1) - log_scale
         entropy = dist.entropy().sum(dim=-1) + log_scale
-        value = self.critic(features).squeeze(-1)
+        value = self.critic(packed_features).squeeze(-1)
 
-        mask = mask.bool()
-        action = action.masked_fill(~mask[..., None], 0.0)
-        logprob = logprob.masked_fill(~mask, 0.0)
-        entropy = entropy.masked_fill(~mask, 0.0)
-        value = value.masked_fill(~mask, 0.0)
-        return action, logprob, entropy, value
+        action_out[mask] = packed_action.to(dtype=action_out.dtype)
+        logprob_out[mask] = logprob.to(dtype=logprob_out.dtype)
+        entropy_out[mask] = entropy.to(dtype=entropy_out.dtype)
+        value_out[mask] = value.to(dtype=value_out.dtype)
+        return action_out, logprob_out, entropy_out, value_out

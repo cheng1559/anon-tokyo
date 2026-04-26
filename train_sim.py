@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm.auto import tqdm
 
 from anon_tokyo.data.datamodule import collate_fn
 from anon_tokyo.data.womd_dataset import WOMDDataset
@@ -146,9 +149,27 @@ def reduce_metrics(metrics: dict[str, float], is_distributed: bool, device: torc
     return {key: float(value.detach().cpu()) for key, value in zip(keys, values)}
 
 
+def warn_single_process_heavy_config(cfg: dict[str, Any], world_size: int) -> None:
+    if world_size > 1:
+        return
+    data_cfg = cfg.get("data", {})
+    ppo_cfg = cfg.get("ppo", {})
+    batch_size = int(data_cfg.get("batch_size", 16))
+    minibatch_size = ppo_cfg.get("minibatch_size")
+    if batch_size >= 512 or (minibatch_size is not None and int(minibatch_size) >= 10000):
+        print(
+            {
+                "warning": "single-process run with large per-GPU PPO config; use torchrun --nproc_per_node=8 or lower batch/minibatch",
+                "batch_size_per_gpu": batch_size,
+                "minibatch_size": minibatch_size,
+            }
+        )
+
+
 def main() -> None:
     args = parse_args()
     is_distributed, rank, local_rank, world_size, device = setup_distributed()
+    writer: SummaryWriter | None = None
     try:
         cfg = load_config(args.config)
         apply_overrides(cfg, args)
@@ -162,21 +183,20 @@ def main() -> None:
         device = env.device
         batch = next(iter(loader))
 
-        if is_rank_zero(rank):
-            per_gpu_batch = int(cfg["data"].get("batch_size", 16))
-            print(
-                {
-                    "ddp": is_distributed,
-                    "rank": rank,
-                    "world_size": world_size,
-                    "local_rank": local_rank,
-                    "device": str(device),
-                    "batch_size_per_gpu": per_gpu_batch,
-                    "global_batch_size": per_gpu_batch * world_size,
-                }
-            )
-
         if args.smoke_env:
+            if is_rank_zero(rank):
+                per_gpu_batch = int(cfg["data"].get("batch_size", 16))
+                print(
+                    {
+                        "ddp": is_distributed,
+                        "rank": rank,
+                        "world_size": world_size,
+                        "local_rank": local_rank,
+                        "device": str(device),
+                        "batch_size_per_gpu": per_gpu_batch,
+                        "global_batch_size": per_gpu_batch * world_size,
+                    }
+                )
             obs = env.reset(batch)
             actions = torch.zeros(obs["controlled_mask"].shape[0], obs["controlled_mask"].shape[1], 2, device=env.device)
             _, reward, done, info = env.step(actions)
@@ -196,10 +216,32 @@ def main() -> None:
         if is_distributed:
             policy = DDP(policy, device_ids=[local_rank], output_device=local_rank)
         ppo_cfg = PPOConfig.from_dict(cfg.get("ppo"))
+        if ppo_cfg.num_updates is None:
+            if ppo_cfg.total_epochs is None:
+                raise ValueError("Set either ppo.num_updates or ppo.total_epochs")
+            ppo_cfg.num_updates = ppo_cfg.total_epochs * len(loader)
         trainer = PPOTrainer(env=env, policy=policy, config=ppo_cfg)
+        if is_rank_zero(rank):
+            warn_single_process_heavy_config(cfg, world_size)
+            per_gpu_batch = int(cfg["data"].get("batch_size", 16))
+            print(
+                {
+                    "ddp": is_distributed,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "local_rank": local_rank,
+                    "device": str(device),
+                    "batch_size_per_gpu": per_gpu_batch,
+                    "global_batch_size": per_gpu_batch * world_size,
+                    "batches_per_epoch": len(loader),
+                    "total_epochs": ppo_cfg.total_epochs,
+                    "num_updates": ppo_cfg.num_updates,
+                }
+            )
         log_dir = Path(cfg.get("trainer", {}).get("log_dir", "tb_logs/simulation"))
         if is_rank_zero(rank):
             log_dir.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(log_dir=str(log_dir))
         save_interval = int(cfg.get("trainer", {}).get("save_interval", 100))
         log_interval = int(cfg.get("trainer", {}).get("log_interval", 20))
 
@@ -207,7 +249,10 @@ def main() -> None:
         if sampler is not None:
             sampler.set_epoch(0)
         data_iter = iter(loader)
-        for update in range(1, ppo_cfg.num_updates + 1):
+        updates = range(1, ppo_cfg.num_updates + 1)
+        progress = tqdm(updates, desc="ppo", dynamic_ncols=True, disable=not is_rank_zero(rank))
+        for update in progress:
+            data_t0 = time.perf_counter()
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -215,10 +260,26 @@ def main() -> None:
                     sampler.set_epoch(update)
                 data_iter = iter(loader)
                 batch = next(data_iter)
+            data_seconds = time.perf_counter() - data_t0
             metrics = trainer.train_one_update(batch)
+            metrics["data_seconds"] = data_seconds
             metrics = reduce_metrics(metrics, is_distributed, device)
+            if is_rank_zero(rank):
+                for key, value in metrics.items():
+                    writer.add_scalar(f"train/{key}", value, update)
+                writer.add_scalar("train/learning_rate", trainer.optimizer.param_groups[0]["lr"], update)
+                progress.set_postfix(
+                    reward=f"{metrics.get('mean_reward', 0.0):.4f}",
+                    policy=f"{metrics.get('policy_loss', 0.0):.4f}",
+                    value=f"{metrics.get('value_loss', 0.0):.4f}",
+                    kl=f"{metrics.get('approx_kl', 0.0):.5f}",
+                    data=f"{metrics.get('data_seconds', 0.0):.1f}s",
+                    rollout=f"{metrics.get('rollout_seconds', 0.0):.1f}s",
+                    upd=f"{metrics.get('update_seconds', 0.0):.1f}s",
+                )
             if is_rank_zero(rank) and update % log_interval == 0:
-                print({"update": update, **metrics})
+                progress.write(str({"update": update, **metrics}))
+                writer.flush()
             if is_rank_zero(rank) and update % save_interval == 0:
                 torch.save(
                     {
@@ -229,7 +290,10 @@ def main() -> None:
                     },
                     log_dir / f"checkpoint_{update}.pt",
                 )
+                writer.flush()
     finally:
+        if writer is not None:
+            writer.close()
         cleanup_distributed(is_distributed)
 
 

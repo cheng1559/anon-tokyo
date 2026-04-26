@@ -44,6 +44,12 @@ def _to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
+def _index_tensor(value: Any, device: torch.device) -> Tensor:
+    if isinstance(value, Tensor):
+        return value.to(device)
+    return torch.as_tensor(value, device=device)
+
+
 class ClosedLoopEnv:
     """Batched closed-loop simulator.
 
@@ -266,7 +272,7 @@ class ClosedLoopEnv:
             "obj_types": self.batch["obj_types"],
             "agent_mask": self.valid[:, :, -1].float(),
             "tracks_to_predict": self.batch["tracks_to_predict"],
-            "sdc_track_index": self.batch["sdc_track_index"],
+            "sdc_track_index": _index_tensor(self.batch["sdc_track_index"], self.device),
             "map_polylines": self.batch["map_polylines"],
             "map_polylines_mask": self.batch["map_polylines_mask"],
             "map_polylines_center": self.batch["map_polylines_center"],
