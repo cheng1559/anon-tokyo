@@ -359,7 +359,7 @@ onBeforeUnmount(() => {
                 <header class="bg-background sticky top-0 z-50 flex w-full items-center justify-between border border-b p-3 px-6 backdrop-blur-xl">
                     <div class="flex items-center gap-4">
                         <h1 class="text-primary flex items-center gap-2 text-xl font-bold">
-                            <Icon class="mb-0.5 size-6" icon="lucide:car-front" />
+                            <img class="h-8 w-auto mt-1" alt="Anon Tokyo Logo" src="/favicon.png" />
                             Anon Tokyo Visualizer
                         </h1>
                         <div class="text-muted-foreground text-xs">Interactive Prediction and Simulation Visualizer</div>
