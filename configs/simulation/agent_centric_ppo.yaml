@@ -5,13 +5,15 @@ model:
   class_path: anon_tokyo.simulation.agent_centric.model.AgentCentricModel
   init_args:
     d_model: 256
-    num_layers: 2
     num_heads: 4
-    sparse_k: 16
-    dropout: 0.1
     max_context_agents: 16
-    max_context_maps: 128
-    use_map_self_attention: false
+    max_lanes: 96
+    history_steps: 5
+    enable_occupancy_grid: true
+    use_layer_norm_layout: true
+    agent_filter_radius: 200.0
+    topk_front_weight: 10.0
+    topk_rear_weight: 2.0
     action_low: [-5.0, -1.0]
     action_high: [3.0, 1.0]
 
@@ -32,7 +34,7 @@ env:
   device: cuda
   num_steps: 80
   history_steps: 5
-  goal_sampling_mode: last
+  goal_sampling_mode: linear
   goal_sampling_gamma: 2.0
   dynamics:
     min_jerk_long: -5.0

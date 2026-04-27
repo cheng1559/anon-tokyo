@@ -165,12 +165,12 @@ Available prediction configs:
 
 ## Official WOMD Evaluation
 
-Evaluation has two steps:
+Prediction evaluation has two steps:
 
 1. Load a checkpoint in the main environment and export predictions to NPZ.
 2. Run the official Waymo motion metrics in `.venv-scripts`.
 
-Run the full pipeline:
+Run the full prediction pipeline:
 
 ```bash
 bash scripts/eval.sh \
@@ -194,6 +194,35 @@ uv run python scripts/export_predictions.py \
   --eval_second 8 \
   --num_modes 6
 ```
+
+## Closed-Loop Simulation Evaluation
+
+Simulation checkpoints are evaluated with deterministic closed-loop rollouts in the main PyTorch environment. The shared
+`scripts/eval.sh` wrapper automatically switches to simulation evaluation when the config is under `configs/simulation/`:
+
+```bash
+bash scripts/eval.sh \
+  configs/simulation/anon_tokyo_ppo.yaml \
+  tb_logs/simulation_anon_tokyo/checkpoint_100.pt \
+  validation \
+  results/anon_tokyo_sim_eval.json
+```
+
+Run the simulation evaluator directly for smoke checks or runtime overrides:
+
+```bash
+uv run python scripts/eval_sim.py \
+  --config configs/simulation/anon_tokyo_ppo.yaml \
+  --ckpt tb_logs/simulation_anon_tokyo/checkpoint_100.pt \
+  --split validation \
+  --output results/anon_tokyo_sim_eval.json \
+  --max_batches 10 \
+  --batch_size 32 \
+  --rollout_steps 40
+```
+
+The JSON output includes aggregate rollout metrics such as `collision_rate`, `offroad_rate`, `goal_reaching_rate`, and
+`mean_reward`.
 
 ## Closed-Loop PPO Simulation
 
