@@ -90,6 +90,8 @@ class JerkPncConfig:
     max_tire_angle_rate_lower_bound: float = 0.03
     max_tire_angle_rate_upper_bound: float = 0.3 * 0.7
     max_tire_angle_rate_gain: float = 1.39 * 0.7
+    lateral_mode_transition_speed: float = 5.0
+    lateral_mode_transition_width: float = 0.3
     curvature_speed_floor: float = 1.0
     min_dynamic_speed: float = MIN_DYNAMIC_SPEED
     positive_jerk_limit_when_negative_acc: float | None = None
@@ -97,10 +99,11 @@ class JerkPncConfig:
 
 
 class JerkPncModel:
-    """Simplified jerk-actuated PNC dynamics.
+    """Hermes-style jerk-actuated PNC dynamics.
 
-    Actions are continuous ``[jerk_long, jerk_lat]``.  The lateral action always
-    means lateral jerk; there is no low-speed switch to steering semantics.
+    Actions are continuous ``[jerk_long, lat_command]``.  The lateral command
+    matches Hermes: low speed interprets it as normalized steering-rate command,
+    high speed interprets it as lateral jerk, with a smooth speed blend.
     """
 
     def __init__(self, config: JerkPncConfig | None = None) -> None:
@@ -123,6 +126,48 @@ class JerkPncModel:
             min=cfg.max_tire_angle_rate_lower_bound,
             max=cfg.max_tire_angle_rate_upper_bound,
         )
+
+    def _high_speed_lateral_weight(self, speed: Tensor) -> Tensor:
+        cfg = self.config
+        width = max(float(cfg.lateral_mode_transition_width), 1e-3)
+        return torch.sigmoid((speed - float(cfg.lateral_mode_transition_speed)) / width)
+
+    def _lat_command_to_steering_rate(self, lat_command: Tensor, speed: Tensor) -> Tensor:
+        cfg = self.config
+        scale = max(abs(float(cfg.min_jerk_lat)), abs(float(cfg.max_jerk_lat)), 1e-3)
+        lat_cmd_norm = (lat_command / scale).clamp(-1.0, 1.0)
+        return lat_cmd_norm * self._delta_steering_rate_bound(speed)
+
+    def _compute_lateral_target_steering(
+        self,
+        lat_command: Tensor,
+        speed: Tensor,
+        steering: Tensor,
+        wheelbase: Tensor,
+        v_long: Tensor,
+        a_long: Tensor,
+        next_a_long_control: Tensor,
+        dt: float,
+    ) -> Tensor:
+        cfg = self.config
+        current_curvature = torch.tan(steering) / wheelbase
+        current_a_lat = v_long.square() * current_curvature
+        target_a_lat = _apply_jerk_and_clamp_acceleration(
+            current_a_lat,
+            lat_command,
+            dt,
+            cfg.min_a_lat,
+            cfg.max_a_lat,
+        )
+        pred_v_long = (v_long + 0.5 * (a_long + next_a_long_control) * dt).clamp(cfg.min_speed, cfg.max_speed)
+        target_curvature = target_a_lat / pred_v_long.square().clamp_min(cfg.curvature_speed_floor)
+        target_steering_from_jerk = torch.atan(target_curvature * wheelbase)
+
+        steering_rate_cmd = self._lat_command_to_steering_rate(lat_command, speed)
+        target_steering_from_rate = steering + steering_rate_cmd * dt
+
+        jerk_weight = self._high_speed_lateral_weight(speed)
+        return jerk_weight * target_steering_from_jerk + (1.0 - jerk_weight) * target_steering_from_rate
 
     @staticmethod
     def _dynamic_lateral_update(
@@ -163,7 +208,7 @@ class JerkPncModel:
         dt = cfg.dt
 
         jerk_long = actions[..., 0].clamp(cfg.min_jerk_long, cfg.max_jerk_long)
-        jerk_lat = actions[..., 1].clamp(cfg.min_jerk_lat, cfg.max_jerk_lat)
+        lat_command = actions[..., 1].clamp(cfg.min_jerk_lat, cfg.max_jerk_lat)
 
         v_long, v_lat = velocity_body_frame_components(velocities, headings)
         speed = velocities.norm(dim=-1)
@@ -184,11 +229,16 @@ class JerkPncModel:
         )
         next_v_long = (v_long + 0.5 * (a_long + next_a_long) * dt).clamp(cfg.min_speed, cfg.max_speed)
 
-        current_curvature = torch.tan(steering) / wheelbase
-        current_a_lat = v_long.square() * current_curvature
-        target_a_lat = (current_a_lat + jerk_lat * dt).clamp(cfg.min_a_lat, cfg.max_a_lat)
-        target_curvature = target_a_lat / next_v_long.square().clamp_min(cfg.curvature_speed_floor)
-        target_steering = torch.atan(target_curvature * wheelbase)
+        target_steering = self._compute_lateral_target_steering(
+            lat_command,
+            speed,
+            steering,
+            wheelbase,
+            v_long,
+            a_long,
+            next_a_long,
+            dt,
+        )
 
         delta_bound = self._delta_steering_rate_bound(speed) * dt
         delta_steering = (target_steering - steering).clamp(-delta_bound, delta_bound)
@@ -219,7 +269,7 @@ class JerkPncModel:
             "steering": next_steering,
             "yaw_rate": next_yaw_rate,
             "jerk_long": jerk_long,
-            "jerk_lat": jerk_lat,
+            "jerk_lat": lat_command,
         }
 
 

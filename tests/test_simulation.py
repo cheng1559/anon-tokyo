@@ -202,20 +202,16 @@ def test_offroad_ignores_solid_lane_lines() -> None:
 
 def test_agent_centric_policy_forward_shapes() -> None:
     batch = _batch(max_agents=4)
-    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=4))
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=5))
     obs = env.reset(batch)
     policy = AgentCentricModel(
         d_model=32,
-        num_layers=1,
         num_heads=4,
-        sparse_k=4,
         max_context_agents=4,
-        max_context_maps=4,
+        max_lanes=4,
+        history_steps=5,
+        no_goal_allowed=True,
     )
-    encoded = policy.encoder(obs)
-    target_mask = obs["controlled_mask"].bool() & obs["agent_mask"].bool()
-    assert torch.equal(encoded["ego_mask"], target_mask)
-    assert encoded["ego_feature"][~target_mask].abs().sum() == 0
 
     action, logprob, entropy, value = policy(obs, sampling_method="mean")
 
@@ -229,51 +225,30 @@ def test_agent_centric_policy_forward_shapes() -> None:
     assert torch.all(action[..., 1] <= 1.0)
 
 
-def test_agent_centric_encoder_uses_nearest_local_context() -> None:
-    A = 40
-    M = 160
-    T = 2
-    P = 2
-    positions = torch.stack((torch.arange(A, dtype=torch.float32), torch.zeros(A)), dim=-1).unsqueeze(0)
-    map_centers = torch.stack((torch.arange(M, dtype=torch.float32), torch.zeros(M)), dim=-1).unsqueeze(0)
-    obj_trajs = torch.zeros(1, A, T, 10)
-    obj_trajs[..., 0:2] = positions[:, :, None, :]
-    obj_trajs[..., 3:6] = torch.tensor([4.5, 2.0, 1.5])
-    obj_trajs[..., 7] = 1.0
-
-    map_polys = torch.zeros(1, M, P, 7)
-    map_polys[..., 0:2] = map_centers[:, :, None, :]
-    map_polys[..., 1, 0] += 0.5
-    map_polys[..., 3] = 1.0
-
-    obs = {
-        "obj_trajs": obj_trajs,
-        "obj_trajs_mask": torch.ones(1, A, T),
-        "obj_positions": positions,
-        "obj_headings": torch.zeros(1, A),
-        "obj_types": torch.ones(1, A, dtype=torch.long),
-        "agent_mask": torch.ones(1, A, dtype=torch.bool),
-        "controlled_mask": torch.tensor([[True] + [False] * (A - 1)]),
-        "map_polylines": map_polys,
-        "map_polylines_mask": torch.ones(1, M, P),
-        "map_polylines_center": map_centers,
-        "map_mask": torch.ones(1, M, dtype=torch.bool),
-    }
+def test_agent_centric_forward_and_checkpoint_keys() -> None:
+    batch = _batch(max_agents=4)
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=5))
+    obs = env.reset(batch)
     policy = AgentCentricModel(
         d_model=32,
-        num_layers=0,
         num_heads=4,
-        sparse_k=4,
-        max_context_agents=32,
-        max_context_maps=128,
+        max_context_agents=4,
+        max_lanes=4,
+        history_steps=5,
+        no_goal_allowed=True,
     )
 
-    encoded = policy.encoder(obs)
+    checkpoint_state = {f"model.{key}": value for key, value in policy.model.model.state_dict().items()}
+    missing, unexpected = policy.load_state_dict(checkpoint_state, strict=True)
+    assert not missing
+    assert not unexpected
 
-    assert encoded["context_agent_indices"].shape == (1, A, 32)
-    assert encoded["context_map_indices"].shape == (1, A, 128)
-    torch.testing.assert_close(encoded["context_agent_indices"][0, 0], torch.arange(32))
-    torch.testing.assert_close(encoded["context_map_indices"][0, 0], torch.arange(128))
+    action, logprob, entropy, value = policy(obs, sampling_method="mean")
+
+    assert action.shape == (1, 4, 2)
+    assert logprob.shape == (1, 4)
+    assert entropy.shape == (1, 4)
+    assert value.shape == (1, 4)
 
 
 def test_query_centric_and_anon_tokyo_policy_forward_shapes() -> None:
@@ -351,3 +326,36 @@ def test_ppo_update_uses_map_tokens_without_raw_map_geometry() -> None:
     metrics = trainer.train_one_update(batch, sampling_method="mean")
 
     assert metrics["value_loss"] >= 0
+
+
+class _ModuleWrapper(nn.Module):
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+def test_ppo_buffer_keeps_raw_maps_for_wrapped_agent_centric_policy() -> None:
+    batch = _batch(max_agents=4)
+    batch["map_token_features"] = torch.zeros(
+        *batch["map_polylines_center"].shape[:2],
+        11,
+        dtype=batch["map_polylines"].dtype,
+    )
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=1, history_steps=5))
+    policy = AgentCentricModel(
+        d_model=32,
+        num_heads=4,
+        max_context_agents=4,
+        max_lanes=4,
+        history_steps=5,
+    )
+    trainer = PPOTrainer(env, _ModuleWrapper(policy), config=PPOConfig(num_steps=1, optimization_epochs=1, minibatch_size=1))
+
+    buffer, _, _, _ = trainer.collect_rollout(batch, sampling_method="mean")
+
+    assert "map_polylines" in buffer.obs[0]
+    assert "map_polylines_mask" in buffer.obs[0]
+    assert "map_mask" in buffer.obs[0]

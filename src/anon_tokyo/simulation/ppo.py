@@ -100,7 +100,16 @@ def gather_obs(
 
 
 class RolloutBuffer:
-    def __init__(self, num_steps: int, num_envs: int, num_agents: int, action_dim: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        num_agents: int,
+        action_dim: int,
+        device: torch.device,
+        *,
+        drop_raw_map_when_tokenized: bool = True,
+    ) -> None:
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.num_agents = num_agents
@@ -114,6 +123,7 @@ class RolloutBuffer:
         self.dones = torch.zeros(num_steps, num_envs, num_agents, dtype=torch.bool, device=device)
         self.train_masks = torch.zeros(num_steps, num_envs, num_agents, dtype=torch.bool, device=device)
         self.size = 0
+        self.drop_raw_map_when_tokenized = drop_raw_map_when_tokenized
 
     def store(
         self,
@@ -127,12 +137,14 @@ class RolloutBuffer:
     ) -> None:
         if self.size >= self.num_steps:
             raise RuntimeError("RolloutBuffer is full")
-        has_map_tokens = "map_token_features" in obs
+        has_map_tokens = self.drop_raw_map_when_tokenized and "map_token_features" in obs
         stored_obs = {}
         for key, obs_value in obs.items():
+            if not isinstance(obs_value, Tensor):
+                continue
             if has_map_tokens and key in _DROP_FROM_POLICY_BUFFER_WHEN_TOKENIZED:
                 continue
-            stored_obs[key] = obs_value.detach() if isinstance(obs_value, Tensor) else obs_value
+            stored_obs[key] = obs_value.detach()
         self.obs.append(stored_obs)
         self.actions[self.size] = action.detach()
         self.logprobs[self.size] = logprob.detach()
@@ -163,6 +175,13 @@ class PPOTrainer:
             sync_cuda=self.config.profile_cuda_sync,
         )
         self.env.profiler = self.profiler if self.config.profile else None
+
+    def _drop_raw_map_when_tokenized(self) -> bool:
+        policy = self.policy
+        while hasattr(policy, "module"):
+            policy = policy.module
+        architecture = getattr(policy, "architecture", "legacy")
+        return architecture != "agentcentric"
 
     def _autocast_enabled(self) -> bool:
         return self.config.use_bf16 and self.env.device.type == "cuda"
@@ -202,7 +221,14 @@ class PPOTrainer:
         steps = min(self.config.num_steps, self.env.episode_steps)
         if steps <= 0:
             raise RuntimeError("Batch has no future frames for closed-loop rollout")
-        buffer = RolloutBuffer(steps, self.env.num_envs, self.env.num_agents, action_dim=2, device=self.env.device)
+        buffer = RolloutBuffer(
+            steps,
+            self.env.num_envs,
+            self.env.num_agents,
+            action_dim=2,
+            device=self.env.device,
+            drop_raw_map_when_tokenized=self._drop_raw_map_when_tokenized(),
+        )
         prev_done = torch.zeros(self.env.num_envs, self.env.num_agents, dtype=torch.bool, device=self.env.device)
         collision_steps = []
         offroad_steps = []

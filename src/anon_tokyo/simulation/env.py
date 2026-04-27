@@ -314,6 +314,7 @@ class ClosedLoopEnv:
                 "goal_positions": self.goal_positions,
                 "timestep": torch.full((B,), self.step_count, dtype=torch.long, device=self.device),
                 "steering": self.steering[:, :, -1],
+                "acceleration": self.a_long[:, :, -1],
                 "yaw_rate": self.yaw_rate[:, :, -1],
             }
             if "scenario_id" in self.batch:

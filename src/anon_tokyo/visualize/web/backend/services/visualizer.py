@@ -319,7 +319,7 @@ class WebVisualizerService:
         reward_steps = []
         value_steps = []
         for _ in range(env.episode_steps):
-            action, _, _, value = model(obs)
+            action, _, _, value = model(obs, sampling_method="expectation")
             obs, reward, _, info = env.step(action)
             assert env.goal_reached is not None
             collision_steps.append(info["collision"].detach())
