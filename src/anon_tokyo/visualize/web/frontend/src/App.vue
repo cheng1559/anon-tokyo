@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import 'vue-sonner/style.css'
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { useColorMode } from '@vueuse/core'
 import type { ChartData } from 'chart.js'
@@ -58,6 +58,7 @@ const selectedAgentId = ref<number | null>(null)
 const targetAgentsOnly = ref(false)
 const agentSignalTab = ref('reward')
 const isLoading = ref(false)
+const isRecordingVideo = ref(false)
 const statusText = ref('Waiting for initialization...')
 let timer: number | undefined
 
@@ -292,6 +293,124 @@ function stepFrame(delta: number) {
 function resetPlayback() {
     stopPlayback()
     frame.value = 0
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+}
+
+function safeFilePart(value: string | undefined, fallback: string) {
+    return (value || fallback).replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || fallback
+}
+
+function exportBaseName() {
+    const scenario = safeFilePart(currentScenario.value?.id, `world_${worldIndex.value}`)
+    return `anon_tokyo_${scenario}_frame_${frame.value}`
+}
+
+async function saveScreenshot() {
+    const canvas = scenarioCanvas.value?.getCanvas()
+    if (!canvas) {
+        toast.error('Canvas is not ready')
+        return
+    }
+    scenarioCanvas.value?.draw()
+    canvas.toBlob((blob) => {
+        if (!blob) {
+            toast.error('Failed to create screenshot')
+            return
+        }
+        downloadBlob(blob, `${exportBaseName()}.png`)
+        toast.success('Screenshot saved')
+    }, 'image/png')
+}
+
+function recorderMimeType() {
+    const options = [
+        'video/mp4;codecs=avc1.42E01E',
+        'video/mp4;codecs=h264',
+        'video/mp4',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm'
+    ]
+    return options.find((type) => MediaRecorder.isTypeSupported(type)) ?? ''
+}
+
+function wait(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function saveVideo() {
+    const canvas = scenarioCanvas.value?.getCanvas()
+    if (!canvas || !currentScenario.value) {
+        toast.error('Canvas is not ready')
+        return
+    }
+    if (!('MediaRecorder' in window) || typeof canvas.captureStream !== 'function') {
+        toast.error('This browser cannot record canvas video')
+        return
+    }
+    const mimeType = recorderMimeType()
+    if (!mimeType) {
+        toast.error('No supported video encoder found')
+        return
+    }
+
+    const wasPlaying = playing.value
+    const startFrame = frame.value
+    const fps = 30
+    const endFrame = Math.max(maxFrame.value, 0)
+    const chunks: BlobPart[] = []
+    isRecordingVideo.value = true
+    stopPlayback()
+
+    try {
+        const stream = canvas.captureStream(fps)
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+        const stopped = new Promise<Blob>((resolve) => {
+            recorder.onstop = () => {
+                stream.getTracks().forEach((track) => track.stop())
+                resolve(new Blob(chunks, { type: mimeType || 'video/webm' }))
+            }
+        })
+        recorder.ondataavailable = (event) => {
+            if (event.data.size > 0) chunks.push(event.data)
+        }
+
+        recorder.start()
+        for (let idx = 0; idx <= endFrame; idx++) {
+            frame.value = idx
+            await nextTick()
+            scenarioCanvas.value?.draw()
+            await wait(1000 / fps)
+        }
+        recorder.stop()
+        const blob = await stopped
+        const extension = mimeType.includes('mp4') ? 'mp4' : 'webm'
+        downloadBlob(blob, `${safeFilePart(currentScenario.value.id, `world_${worldIndex.value}`)}.${extension}`)
+        if (extension === 'mp4') {
+            toast.success('MP4 saved')
+        } else {
+            toast.info('MP4 is not supported in this browser; saved WebM instead')
+        }
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        toast.error(`Failed to save video: ${message}`)
+    } finally {
+        isRecordingVideo.value = false
+        frame.value = startFrame
+        await nextTick()
+        scenarioCanvas.value?.draw()
+        if (wasPlaying) playing.value = true
+    }
 }
 
 function navigateWorld(delta: number) {
@@ -620,6 +739,17 @@ onBeforeUnmount(() => {
                     <ResizableHandle with-handle />
 
                     <ResizablePanel class="relative flex items-center justify-center overflow-hidden backdrop-blur-xl" :default-size="60">
+                        <div class="absolute top-3 right-3 z-10 flex items-center gap-2">
+                            <Button size="icon-sm" title="Save screenshot" variant="secondary" :disabled="!currentScenario" @click="saveScreenshot">
+                                <Icon class="size-4" icon="lucide:camera" />
+                                <span class="sr-only">Save screenshot</span>
+                            </Button>
+                            <Button size="icon-sm" title="Save MP4" variant="secondary" :disabled="!currentScenario || isRecordingVideo" @click="saveVideo">
+                                <Spinner v-if="isRecordingVideo" class="size-4" />
+                                <Icon v-else class="size-4" icon="lucide:video" />
+                                <span class="sr-only">Save MP4</span>
+                            </Button>
+                        </div>
                         <ScenarioCanvas
                             ref="scenarioCanvas"
                             :frame="frame"

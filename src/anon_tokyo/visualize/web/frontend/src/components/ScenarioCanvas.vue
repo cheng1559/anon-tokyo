@@ -518,6 +518,10 @@ function zoomOut() {
   draw()
 }
 
+function getCanvas() {
+  return canvasRef.value
+}
+
 watch(
   () => props.scenario?.id,
   async () => {
@@ -546,5 +550,5 @@ onBeforeUnmount(() => {
   resizeObserver = undefined
 })
 
-defineExpose({ resetView, resize, zoomIn, zoomOut })
+defineExpose({ draw, getCanvas, resetView, resize, zoomIn, zoomOut })
 </script>
