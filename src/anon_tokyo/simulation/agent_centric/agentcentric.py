@@ -82,7 +82,7 @@ class AgentCentricNet(nn.Module):
         agent_feature_size: int = 15,
         goal_feature_size: int = 2,
         kinematics_feature_size: int = 8,
-        lane_bound_feature_size: int = 6,
+        lane_bound_feature_size: int = 9,
         output_size: int = 2,
         embed_dim: int = 256,
         num_heads: int = 4,
@@ -91,6 +91,7 @@ class AgentCentricNet(nn.Module):
         history_steps: int = 5,
         is_continuous: bool = True,
         use_layer_norm_layout: bool = False,
+        lane_bezier_degree: int = 3,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -99,6 +100,7 @@ class AgentCentricNet(nn.Module):
         self.max_agents = max_agents
         self.history_steps = history_steps
         self.is_continuous = is_continuous
+        self.lane_bezier_degree = lane_bezier_degree
 
         if history_steps > 1 and use_layer_norm_layout:
             self.agent_mlp = nn.Sequential(
@@ -179,6 +181,46 @@ class AgentCentricNet(nn.Module):
             _layer_init(nn.Linear(embed_dim * 4, 1), std=1.0),
         )
 
+    def _polyline_features(self, lane_features: Tensor, lane_mask: Tensor) -> Tensor:
+        p = lane_features.shape[2]
+        dtype = lane_features.dtype
+        device = lane_features.device
+        weight = lane_mask.to(dtype)
+        valid = lane_mask.bool()
+
+        first_idx = valid.float().argmax(dim=-1)
+        last_idx = p - 1 - valid.flip(dims=[-1]).float().argmax(dim=-1)
+        gather_idx = first_idx[..., None, None].expand(-1, -1, 1, 2)
+        start_xy = lane_features[..., 0:2].gather(2, gather_idx).squeeze(2)
+        gather_idx = last_idx[..., None, None].expand(-1, -1, 1, 2)
+        end_xy = lane_features[..., 0:2].gather(2, gather_idx).squeeze(2)
+
+        degree = max(int(self.lane_bezier_degree), 1)
+        t = torch.linspace(0.0, 1.0, p, dtype=dtype, device=device)
+        basis = torch.stack(
+            [
+                math.comb(degree, idx) * (1.0 - t).pow(degree - idx) * t.pow(idx)
+                for idx in range(degree + 1)
+            ],
+            dim=-1,
+        )
+        endpoint_curve = basis[:, 0].view(1, 1, p, 1) * start_xy[..., None, :] + basis[:, -1].view(1, 1, p, 1) * end_xy[..., None, :]
+        if degree > 1:
+            inner_basis = basis[:, 1:-1]
+            residual = lane_features[..., 0:2] - endpoint_curve
+            normal = torch.einsum("...p,pc,pd->...cd", weight, inner_basis, inner_basis)
+            eye = torch.eye(degree - 1, dtype=dtype, device=device)
+            normal = normal + eye.view(*((1,) * (normal.ndim - 2)), *eye.shape) * 1e-4
+            rhs = torch.einsum("...p,pc,...pk->...ck", weight, inner_basis, residual)
+            controls = torch.linalg.solve(normal.float(), rhs.float()).to(dtype)
+            bezier_params = controls.transpose(-1, -2).flatten(start_dim=-2)
+        else:
+            bezier_params = lane_features.new_zeros(*lane_features.shape[:2], 0)
+
+        count = weight.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        line_type = (lane_features[..., 4:5] * weight.unsqueeze(-1)).sum(dim=-2) / count
+        return torch.cat((start_xy, end_xy, bezier_params, line_type), dim=-1)
+
     def forward(
         self,
         agent_features: Tensor,
@@ -204,12 +246,15 @@ class AgentCentricNet(nn.Module):
         goal_reached = goal_features[:, :1, 2:]
         goal_embeddings = _sine_embed_for_position(goal_positions, self.embed_dim)
         kinematics_embeddings = self.kinematics_mlp(kinematics_features[:, :1])
-        lane_bound_embeddings = self.lane_bound_mlp(lane_bound_features)
-
-        lane_mask = lane_bound_mask.bool().unsqueeze(-1)
-        pooled_lane = _masked_amax(lane_bound_embeddings, lane_mask, dim=1, keepdim=True)
-        has_lanes = lane_mask.any(dim=1, keepdim=True)
-        global_lane_embedding = torch.where(has_lanes, pooled_lane, self.default_lane_embedding.expand(b, 1, -1))
+        if lane_bound_features.shape[1] == 0 or lane_bound_features.shape[2] == 0:
+            global_lane_embedding = self.default_lane_embedding.expand(b, 1, -1)
+        else:
+            polyline_mask = lane_bound_mask.bool().any(dim=-1, keepdim=True)
+            polyline_features = self._polyline_features(lane_bound_features, lane_bound_mask)
+            polyline_embeddings = self.lane_bound_mlp(polyline_features)
+            pooled_lane = _masked_amax(polyline_embeddings, polyline_mask, dim=1, keepdim=True)
+            has_lanes = polyline_mask.any(dim=1, keepdim=True)
+            global_lane_embedding = torch.where(has_lanes, pooled_lane, self.default_lane_embedding.expand(b, 1, -1))
 
         agent_norm = self.agent_ln1(agent_embeddings)
         attn_mask = None
@@ -254,6 +299,7 @@ class AgentCentricBackbone(nn.Module):
         topk_front_weight: float = 10.0,
         topk_rear_weight: float = 2.0,
         use_layer_norm_layout: bool = False,
+        lane_bezier_degree: int = 3,
         action_low: tuple[float, float] | list[float] = (-5.0, -1.0),
         action_high: tuple[float, float] | list[float] = (3.0, 1.0),
     ) -> None:
@@ -273,6 +319,8 @@ class AgentCentricBackbone(nn.Module):
             history_steps=history_steps,
             is_continuous=True,
             use_layer_norm_layout=use_layer_norm_layout,
+            lane_bezier_degree=lane_bezier_degree,
+            lane_bound_feature_size=(lane_bezier_degree + 1) * 2 + 1,
         )
         self.register_buffer("action_low", torch.tensor(action_low, dtype=torch.float32), persistent=False)
         self.register_buffer("action_high", torch.tensor(action_high, dtype=torch.float32), persistent=False)
@@ -303,18 +351,23 @@ class AgentCentricBackbone(nn.Module):
 
     def _select_lanes(self, lane_features: Tensor, lane_mask: Tensor) -> tuple[Tensor, Tensor]:
         m = lane_features.shape[1]
+        if m == 0:
+            return lane_features, lane_mask
         k = self.max_lanes if self.max_lanes > 0 else max(m // 8, 1)
         k = min(k, m)
         w_front = max(self.topk_front_weight, 1e-6)
         w_rear = max(self.topk_rear_weight, 1e-6)
-        lane_cx = (lane_features[..., 0] + lane_features[..., 2]) * 0.5
-        lane_cy = (lane_features[..., 1] + lane_features[..., 3]) * 0.5
+        point_valid = lane_mask.bool()
+        denom = point_valid.sum(dim=-1).clamp_min(1).to(lane_features.dtype)
+        center = (lane_features[..., 0:2] * point_valid.unsqueeze(-1).to(lane_features.dtype)).sum(dim=-2) / denom.unsqueeze(-1)
+        lane_cx = center[..., 0]
+        lane_cy = center[..., 1]
         w = torch.where(lane_cx >= 0, w_front, w_rear)
         dists = torch.sqrt((lane_cx / w).square() + lane_cy.square())
-        dists = dists.masked_fill(~lane_mask.bool(), torch.inf)
+        dists = dists.masked_fill(~point_valid.any(dim=-1), torch.inf)
         idx = torch.topk(dists, k=k, dim=1, largest=False).indices
-        selected = lane_features.gather(1, idx[..., None].expand(-1, -1, lane_features.shape[-1]))
-        selected_mask = lane_mask.gather(1, idx)
+        selected = lane_features.gather(1, idx[..., None, None].expand(-1, -1, lane_features.shape[2], lane_features.shape[-1]))
+        selected_mask = lane_mask.gather(1, idx[..., None].expand(-1, -1, lane_mask.shape[-1]))
         return selected, selected_mask
 
     def _features(self, obs: dict[str, Tensor]) -> tuple[tuple[Any, ...], Tensor, tuple[int, int]]:
@@ -403,31 +456,26 @@ class AgentCentricBackbone(nn.Module):
         poly_mask = obs["map_mask"].bool()[b_idx]
 
         n, m, p, _ = polys.shape
+        if p == 0:
+            features = polys.new_zeros(n, m, 0, 6)
+            mask = torch.zeros(n, m, 0, dtype=torch.bool, device=polys.device)
+            return features, mask
+
         valid_count = point_mask.sum(dim=-1)
         lane_mask = (valid_count > 0) & poly_mask
-        first_idx = point_mask.float().argmax(dim=-1)
-        last_idx = p - 1 - point_mask.flip(dims=[-1]).float().argmax(dim=-1)
-        gather_first = first_idx[..., None, None].expand(n, m, 1, polys.shape[-1])
-        gather_last = last_idx[..., None, None].expand(n, m, 1, polys.shape[-1])
-        first = polys.gather(2, gather_first).squeeze(2)
-        last = polys.gather(2, gather_last).squeeze(2)
 
-        start = first[..., 0:2]
-        end = last[..., 0:2]
-        singleton = valid_count == 1
-        fallback_dir = F.normalize(first[..., 3:5], p=2, dim=-1, eps=1e-6)
-        end = torch.where(singleton[..., None], start + fallback_dir, end)
-        raw_type = first[..., 6:7]
-
-        first_xy = _rotate_to_local(start - base_pos[:, None], base_heading[:, None])
-        last_xy = _rotate_to_local(end - base_pos[:, None], base_heading[:, None])
-        min_dist = torch.minimum(first_xy.norm(dim=-1), last_xy.norm(dim=-1))
+        local_xy = _rotate_to_local(polys[..., 0:2] - base_pos[:, None, None], base_heading[:, None, None])
+        local_dir = _rotate_to_local(polys[..., 3:5], base_heading[:, None, None])
+        dist = local_xy.norm(dim=-1).masked_fill(~point_mask, torch.inf)
+        min_dist = dist.amin(dim=-1)
         lane_mask = lane_mask & (min_dist <= self.agent_filter_radius)
 
+        raw_type = polys[..., 6:7]
         speed = torch.zeros_like(raw_type)
-        features = torch.cat((first_xy, last_xy, raw_type, speed), dim=-1)
-        features = features * lane_mask.unsqueeze(-1).to(features.dtype)
-        return features, lane_mask
+        features = torch.cat((local_xy, local_dir, raw_type, speed), dim=-1)
+        point_mask = point_mask & lane_mask.unsqueeze(-1)
+        features = features * point_mask.unsqueeze(-1).to(features.dtype)
+        return features, point_mask
 
     def forward(
         self,

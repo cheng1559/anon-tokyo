@@ -23,6 +23,7 @@ def _minimal_batch() -> dict[str, torch.Tensor | list[str]]:
         "map_polylines_mask": torch.zeros(1, 0, 0, dtype=torch.bool),
         "controlled_mask": torch.tensor([[False, True]]),
         "goal_positions": torch.zeros(1, 2, 2),
+        "current_time_index": torch.tensor([0]),
     }
 
 
@@ -45,6 +46,34 @@ def test_serialize_simulation_keeps_invalid_rollout_frames_aligned() -> None:
     )
 
     tracks = {track["agent_id"]: track for track in payload["scenarios"][0]["rollout"]}
+    assert payload["scenarios"][0]["agents"][0]["history"] == []
+    assert payload["scenarios"][0]["sim_start_frame"] == 1
     assert tracks[0]["valid"] == [1, 0, 1, 0]
     assert tracks[0]["points"] == [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]]
     assert tracks[1]["valid"] == [1, 1, 0, 0]
+
+
+def test_serialize_simulation_preprocessed_map_polylines() -> None:
+    batch = _minimal_batch()
+    batch.update(
+        {
+            "preprocessed_map_polylines": torch.tensor(
+                [
+                    [
+                        [[1.0, 2.0], [3.0, 4.0], [9.0, 9.0]],
+                        [[5.0, 6.0], [7.0, 8.0], [9.0, 9.0]],
+                    ]
+                ]
+            ),
+            "preprocessed_map_mask": torch.tensor([[[True, True, False], [False, False, False]]]),
+            "preprocessed_map_types": torch.tensor([[[1.0, 1.0, 1.0], [7.0, 7.0, 7.0]]]),
+            "preprocessed_map_batch_idx": torch.tensor([0]),
+            "preprocessed_map_agent_idx": torch.tensor([1]),
+            "preprocessed_map_frame": torch.tensor([1]),
+        }
+    )
+
+    payload = serialize_simulation_batch(batch)
+
+    records = payload["scenarios"][0]["preprocessed_map"]
+    assert records == [{"frame": 1, "agent_id": 1, "polylines": [{"type": 1, "points": [[1.0, 2.0], [3.0, 4.0]]}]}]

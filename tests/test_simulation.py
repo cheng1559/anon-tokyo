@@ -8,7 +8,6 @@ from anon_tokyo.data.datamodule import collate_fn
 from anon_tokyo.data.transforms import simulation_transform
 from anon_tokyo.simulation.dynamics import JerkPncConfig, JerkPncModel
 from anon_tokyo.simulation.env import ClosedLoopEnv, ClosedLoopEnvConfig
-from anon_tokyo.simulation.agent_centric.agentcentric import AgentCentricBackbone
 from anon_tokyo.simulation.agent_centric.model import AgentCentricModel
 from anon_tokyo.simulation.anon_tokyo.model import AnonTokyoModel
 from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer
@@ -276,29 +275,27 @@ def test_agent_centric_policy_forward_shapes() -> None:
     assert torch.all(action[..., 1] <= 1.0)
 
 
-def test_agent_centric_lane_features_split_by_curvature() -> None:
-    backbone = AgentCentricBackbone(max_lanes=8, lane_curve_angle_threshold=0.1)
-    map_polylines = torch.zeros(1, 1, 5, 7)
-    map_polylines[0, 0, :, 0:2] = torch.tensor(
-        [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [20.0, 10.0], [20.0, 20.0]]
-    )
-    map_polylines[0, 0, :, 6] = 15.0
-    obs = {
-        "map_polylines": map_polylines,
-        "map_polylines_mask": torch.ones(1, 1, 5, dtype=torch.bool),
-        "map_mask": torch.ones(1, 1, dtype=torch.bool),
-    }
-
-    features, mask = backbone._lane_features(
-        obs,
-        torch.tensor([0]),
-        torch.tensor([[0.0, 0.0]]),
-        torch.tensor([0.0]),
+def test_agent_centric_lane_features_keep_polyline_points() -> None:
+    batch = _batch(max_agents=4)
+    env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=5))
+    obs = env.reset(batch)
+    policy = AgentCentricModel(
+        d_model=32,
+        num_heads=4,
+        max_context_agents=4,
+        max_lanes=4,
+        history_steps=5,
+        no_goal_allowed=True,
     )
 
-    assert mask.sum() == 2
-    torch.testing.assert_close(features[0, 0, 0:4], torch.tensor([0.0, 0.0, 20.0, 0.0]))
-    torch.testing.assert_close(features[0, 1, 0:4], torch.tensor([20.0, 0.0, 20.0, 20.0]))
+    features, _, _ = policy.model._features(obs)
+    lane_features = features[4]
+    lane_mask = features[5]
+
+    assert lane_features.ndim == 4
+    assert lane_mask.ndim == 3
+    assert lane_features.shape[2] == obs["map_polylines"].shape[2]
+    assert lane_features.shape[:3] == lane_mask.shape
 
 
 def test_agent_centric_forward_and_checkpoint_keys() -> None:

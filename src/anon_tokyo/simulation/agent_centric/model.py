@@ -21,12 +21,12 @@ class AgentCentricModel(nn.Module):
         architecture: str = "agentcentric",
         max_lanes: int = 96,
         history_steps: int = 5,
-        enable_occupancy_grid: bool = True,
         no_goal_allowed: bool = True,
         agent_filter_radius: float = 200.0,
         topk_front_weight: float = 10.0,
         topk_rear_weight: float = 2.0,
         use_layer_norm_layout: bool = False,
+        lane_bezier_degree: int = 3,
     ) -> None:
         super().__init__()
         if architecture != "agentcentric":
@@ -38,12 +38,12 @@ class AgentCentricModel(nn.Module):
             max_agents=max_context_agents,
             max_lanes=max_lanes,
             history_steps=history_steps,
-            enable_occupancy_grid=enable_occupancy_grid,
             no_goal_allowed=no_goal_allowed,
             agent_filter_radius=agent_filter_radius,
             topk_front_weight=topk_front_weight,
             topk_rear_weight=topk_rear_weight,
             use_layer_norm_layout=use_layer_norm_layout,
+            lane_bezier_degree=lane_bezier_degree,
             action_low=action_low,
             action_high=action_high,
         )

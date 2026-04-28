@@ -13,6 +13,7 @@ model:
     agent_filter_radius: 200.0
     topk_front_weight: 10.0
     topk_rear_weight: 2.0
+    num_polyline_points: 20
     action_low: [-5.0, -1.0]
     action_high: [3.0, 1.0]
 
