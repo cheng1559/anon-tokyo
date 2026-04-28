@@ -10,7 +10,7 @@ from anon_tokyo.simulation.dynamics import JerkPncConfig, JerkPncModel
 from anon_tokyo.simulation.env import ClosedLoopEnv, ClosedLoopEnvConfig
 from anon_tokyo.simulation.agent_centric.model import AgentCentricModel
 from anon_tokyo.simulation.anon_tokyo.model import AnonTokyoModel
-from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer
+from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer, scheduled_learning_rate
 from anon_tokyo.simulation.query_centric.model import QueryCentricModel
 from anon_tokyo.simulation.rewards import RewardConfig, compute_rewards
 
@@ -248,6 +248,20 @@ def test_pedestrian_cyclist_only_use_goal_ttc_tto_collision_rewards() -> None:
     assert not info["offroad"][0, 0]
     assert not done[0, 0]
     assert reward[0, 0] > 0.0
+
+
+def test_ppo_learning_rate_schedule_matches_hermes_shapes() -> None:
+    cfg = PPOConfig(learning_rate=3.0e-4, lr_schedule="linear")
+    assert scheduled_learning_rate(cfg, update=1, num_updates=100) == cfg.learning_rate
+    assert scheduled_learning_rate(cfg, update=100, num_updates=100) < cfg.learning_rate * 0.02
+
+    cfg = PPOConfig(learning_rate=3.0e-4, lr_schedule="cosine")
+    assert abs(scheduled_learning_rate(cfg, update=50, num_updates=100) - 1.5e-4) < 1e-12
+    assert scheduled_learning_rate(cfg, update=100, num_updates=100) == 0.0
+
+    cfg = PPOConfig(learning_rate=3.0e-4, lr_schedule="step", lr_schedule_step_perc=(0.5,), lr_schedule_step_factor=0.1)
+    assert scheduled_learning_rate(cfg, update=50, num_updates=100) == cfg.learning_rate
+    assert scheduled_learning_rate(cfg, update=51, num_updates=100) == cfg.learning_rate * 0.1
 
 
 def test_agent_centric_policy_forward_shapes() -> None:

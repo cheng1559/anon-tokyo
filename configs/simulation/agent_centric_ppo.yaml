@@ -13,7 +13,7 @@ model:
     agent_filter_radius: 200.0
     topk_front_weight: 10.0
     topk_rear_weight: 2.0
-    num_polyline_points: 20
+    lane_bezier_degree: 3
     action_low: [-5.0, -1.0]
     action_high: [3.0, 1.0]
 
@@ -75,6 +75,10 @@ ppo:
   vf_clip_epsilon: 0.2
   target_kl: null
   use_bf16: true
+  lr_schedule: cosine
+  lr_schedule_step_perc: []
+  lr_schedule_step_factor: 1.0
+  lr_schedule_cosine_restarts: [0.1, 0.5]
 
 trainer:
   log_dir: tb_logs/simulation_agent_centric

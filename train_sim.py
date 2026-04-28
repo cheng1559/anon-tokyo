@@ -355,13 +355,14 @@ def main() -> None:
                 data_iter = iter(loader)
                 batch = next(data_iter)
             data_seconds = time.perf_counter() - data_t0
+            lr = trainer.apply_lr_schedule(update, ppo_cfg.num_updates)
             metrics = trainer.train_one_update(batch)
             metrics["data_seconds"] = data_seconds
+            metrics["learning_rate"] = lr
             metrics = reduce_metrics(metrics, is_distributed, device)
             if is_rank_zero(rank):
                 for key, value in metrics.items():
                     writer.add_scalar(f"train/{key}", value, update)
-                writer.add_scalar("train/learning_rate", trainer.optimizer.param_groups[0]["lr"], update)
                 progress.set_postfix(
                     reward=f"{metrics.get('mean_reward', 0.0):.4f}",
                     policy=f"{metrics.get('policy_loss', 0.0):.4f}",

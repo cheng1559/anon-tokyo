@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import math
 import time
 from typing import Any
 
@@ -48,10 +49,51 @@ class PPOConfig:
     use_bf16: bool = False
     profile: bool = False
     profile_cuda_sync: bool = True
+    lr_schedule: str = "cosine"
+    lr_schedule_step_perc: tuple[float, ...] = ()
+    lr_schedule_step_factor: float = 1.0
+    lr_schedule_cosine_restarts: tuple[float, ...] = (0.1, 0.5)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PPOConfig":
-        return cls(**dict(data or {}))
+        values = dict(data or {})
+        for key in ("lr_schedule_step_perc", "lr_schedule_cosine_restarts"):
+            if key in values:
+                values[key] = tuple(float(v) for v in values[key])
+        return cls(**values)
+
+
+def scheduled_learning_rate(cfg: PPOConfig, update: int, num_updates: int) -> float:
+    """Hermes-compatible PPO learning-rate schedule."""
+    if num_updates <= 0:
+        return cfg.learning_rate
+    schedule = cfg.lr_schedule
+    if schedule == "linear":
+        frac = 1.0 - (update - 1.0) / num_updates
+        return frac * cfg.learning_rate
+    if schedule == "step":
+        frac = update / num_updates
+        lr_multiplier = 1.0
+        for change_percentage in cfg.lr_schedule_step_perc:
+            if frac > change_percentage:
+                lr_multiplier *= cfg.lr_schedule_step_factor
+        return lr_multiplier * cfg.learning_rate
+    if schedule == "cosine":
+        frac = update / num_updates
+        return 0.5 * cfg.learning_rate * (1.0 + math.cos(frac * math.pi))
+    if schedule == "cosine_restart":
+        restarts = tuple(sorted(p for p in cfg.lr_schedule_cosine_restarts if 0.0 <= p < 1.0))
+        boundaries = (0.0, *restarts, 1.0)
+        frac = update / (num_updates + 1.0)
+        current_idx = 0
+        for idx, start in enumerate(boundaries[:-1]):
+            if frac >= start:
+                current_idx = idx
+        start = boundaries[current_idx]
+        end = boundaries[current_idx + 1]
+        interval_frac = (frac - start) / max(end - start, 1e-8)
+        return 0.5 * cfg.learning_rate * (1.0 + math.cos(interval_frac * math.pi))
+    return cfg.learning_rate
 
 
 def masked_mean(x: Tensor, mask: Tensor, eps: float = 1e-8) -> Tensor:
@@ -175,6 +217,12 @@ class PPOTrainer:
             sync_cuda=self.config.profile_cuda_sync,
         )
         self.env.profiler = self.profiler if self.config.profile else None
+
+    def apply_lr_schedule(self, update: int, num_updates: int | None = None) -> float:
+        lr = scheduled_learning_rate(self.config, update, num_updates or self.config.num_updates or update)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+        return lr
 
     def _drop_raw_map_when_tokenized(self) -> bool:
         policy = self.policy
