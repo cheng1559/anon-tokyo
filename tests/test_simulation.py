@@ -200,6 +200,43 @@ def test_offroad_ignores_solid_lane_lines() -> None:
     assert not done[0, 0]
 
 
+def test_rewards_centerline_solid_line_and_tto() -> None:
+    state = _reward_state()
+    state["positions"] = torch.tensor([[[0.0, 1.0], [20.0, 0.0], [40.0, 0.0]]])
+    state["velocities"] = torch.tensor([[[2.0, 0.0], [0.0, 0.0], [0.0, 0.0]]])
+    state["map_polylines"] = torch.zeros(1, 3, 2, 7)
+    state["map_polylines_mask"] = torch.ones(1, 3, 2)
+    state["map_polylines"][0, 0, :, 0] = torch.tensor([-5.0, 5.0])
+    state["map_polylines"][0, 0, :, 1] = 0.0
+    state["map_polylines"][0, 0, :, 6] = 1.0
+    state["map_polylines"][0, 1, :, 0] = torch.tensor([-5.0, 5.0])
+    state["map_polylines"][0, 1, :, 1] = 1.0
+    state["map_polylines"][0, 1, :, 6] = 7.0
+    state["map_polylines"][0, 2, :, 0] = 2.0
+    state["map_polylines"][0, 2, :, 1] = torch.tensor([-3.0, 3.0])
+    state["map_polylines"][0, 2, :, 6] = 15.0
+    state["obj_types"] = torch.tensor([[1, 1, 1]])
+
+    _, _, info, _ = compute_rewards(state, RewardConfig())
+
+    assert info["centerline_score"][0, 0] < 1.0
+    assert info["solid_line_crossed"][0, 0]
+    assert info["tto_alert"][0, 0]
+
+
+def test_pedestrian_cyclist_only_use_goal_ttc_tto_collision_rewards() -> None:
+    state = _reward_state()
+    state["positions"] = torch.tensor([[[0.0, -1.1], [8.0, 0.0], [20.0, 0.0]]])
+    state["map_polylines"][:, :, :, 1] = -1.1
+    state["obj_types"] = torch.tensor([[2, 1, 1]])
+
+    reward, done, info, _ = compute_rewards(state, RewardConfig(offroad_distance_threshold=0.2))
+
+    assert info["offroad"][0, 0]
+    assert not done[0, 0]
+    assert reward[0, 0] > 0.0
+
+
 def test_agent_centric_policy_forward_shapes() -> None:
     batch = _batch(max_agents=4)
     env = ClosedLoopEnv(ClosedLoopEnvConfig(device="cpu", num_steps=2, history_steps=5))
