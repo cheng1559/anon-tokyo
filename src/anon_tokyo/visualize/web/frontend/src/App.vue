@@ -78,6 +78,7 @@ const simulationControlModeOptions = [
 ]
 
 const currentScenario = computed(() => batch.value?.scenarios[worldIndex.value] ?? null)
+const defaultFrame = computed(() => currentScenario.value?.sim_start_frame ?? (task.value === 'simulation' ? 11 : 0))
 const selectedAgentValue = computed({
     get: () => (targetAgentsOnly.value ? 'targets' : selectedAgentId.value === null ? 'all' : String(selectedAgentId.value)),
     set: (value: string) => {
@@ -145,6 +146,7 @@ function selectAgent(agentId: number) {
 }
 
 function agentState(agent: Agent): 'collision' | 'offroad' | 'goal' | 'controlled' | 'default' {
+    if (currentScenario.value?.sim_start_frame !== undefined && frame.value < currentScenario.value.sim_start_frame) return 'default'
     const track = trackForAgent(agent.id)
     if (flagAt(track?.collision, frame.value)) return 'collision'
     if (flagAt(track?.offroad, frame.value)) return 'offroad'
@@ -262,7 +264,7 @@ async function loadBatch() {
         logStatus('INFO', `Fetch batch ${batchIndex.value}`)
         batch.value = await fetchBatch(batchIndex.value, batchSize.value)
         worldIndex.value = 0
-        frame.value = 0
+        frame.value = defaultFrame.value
         scenarioCanvas.value?.resetView()
         logStatus('SUCCESS', `Batch ${batchIndex.value} loaded`)
     } catch (err) {
@@ -292,7 +294,7 @@ function stepFrame(delta: number) {
 
 function resetPlayback() {
     stopPlayback()
-    frame.value = 0
+    frame.value = defaultFrame.value
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -434,7 +436,7 @@ watch(task, () => {
 })
 
 watch(worldIndex, () => {
-    frame.value = 0
+    frame.value = defaultFrame.value
     pickDefaultAgent()
     scenarioCanvas.value?.resetView()
 })

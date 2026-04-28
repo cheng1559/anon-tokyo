@@ -305,6 +305,7 @@ class WebVisualizerService:
     ]:
         env_cfg = dict(self.cfg.get("env") or {})
         env_cfg["device"] = str(self.device)
+        env_cfg["goal_sampling_mode"] = "last"
         env = ClosedLoopEnv(ClosedLoopEnvConfig.from_dict(env_cfg))
         obs = env.reset(batch)
         model = self._build_model()

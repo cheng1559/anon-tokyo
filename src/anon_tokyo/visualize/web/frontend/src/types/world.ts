@@ -68,6 +68,7 @@ export interface Scenario {
   rollout?: RolloutTrack[]
   goals?: Goal[]
   metrics?: SimulationMetrics
+  sim_start_frame?: number
 }
 
 export interface BatchPayload {

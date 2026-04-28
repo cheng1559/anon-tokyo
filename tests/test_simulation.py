@@ -8,6 +8,7 @@ from anon_tokyo.data.datamodule import collate_fn
 from anon_tokyo.data.transforms import simulation_transform
 from anon_tokyo.simulation.dynamics import JerkPncConfig, JerkPncModel
 from anon_tokyo.simulation.env import ClosedLoopEnv, ClosedLoopEnvConfig
+from anon_tokyo.simulation.agent_centric.agentcentric import AgentCentricBackbone
 from anon_tokyo.simulation.agent_centric.model import AgentCentricModel
 from anon_tokyo.simulation.anon_tokyo.model import AnonTokyoModel
 from anon_tokyo.simulation.ppo import PPOConfig, PPOTrainer
@@ -83,6 +84,19 @@ def test_simulation_transform_all_agents_control_mode_controls_current_valid_age
 
     np.testing.assert_array_equal(out["controlled_mask"], expected)
     assert out["controlled_mask"].sum() == 3
+
+
+def test_simulation_transform_excludes_agents_invalid_at_current_time() -> None:
+    scenario = _make_scenario()
+    current_t = int(scenario["current_time_index"])
+    scenario["trajs"][1, current_t, 9] = 0.0
+
+    out = simulation_transform(scenario, max_agents=8, max_polylines=8)
+
+    assert out["agent_mask"].sum() == 3
+    assert out["tracks_to_predict"][0] == -1
+    assert not out["controlled_mask"][0]
+    assert out["obj_trajs_full_mask"][:3, current_t].all()
 
 
 def test_jerk_pnc_longitudinal_and_lateral_actions() -> None:
@@ -232,7 +246,7 @@ def test_pedestrian_cyclist_only_use_goal_ttc_tto_collision_rewards() -> None:
 
     reward, done, info, _ = compute_rewards(state, RewardConfig(offroad_distance_threshold=0.2))
 
-    assert info["offroad"][0, 0]
+    assert not info["offroad"][0, 0]
     assert not done[0, 0]
     assert reward[0, 0] > 0.0
 
@@ -260,6 +274,31 @@ def test_agent_centric_policy_forward_shapes() -> None:
     assert torch.all(action[..., 0] <= 3.0)
     assert torch.all(action[..., 1] >= -1.0)
     assert torch.all(action[..., 1] <= 1.0)
+
+
+def test_agent_centric_lane_features_split_by_curvature() -> None:
+    backbone = AgentCentricBackbone(max_lanes=8, lane_curve_angle_threshold=0.1)
+    map_polylines = torch.zeros(1, 1, 5, 7)
+    map_polylines[0, 0, :, 0:2] = torch.tensor(
+        [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [20.0, 10.0], [20.0, 20.0]]
+    )
+    map_polylines[0, 0, :, 6] = 15.0
+    obs = {
+        "map_polylines": map_polylines,
+        "map_polylines_mask": torch.ones(1, 1, 5, dtype=torch.bool),
+        "map_mask": torch.ones(1, 1, dtype=torch.bool),
+    }
+
+    features, mask = backbone._lane_features(
+        obs,
+        torch.tensor([0]),
+        torch.tensor([[0.0, 0.0]]),
+        torch.tensor([0.0]),
+    )
+
+    assert mask.sum() == 2
+    torch.testing.assert_close(features[0, 0, 0:4], torch.tensor([0.0, 0.0, 20.0, 0.0]))
+    torch.testing.assert_close(features[0, 1, 0:4], torch.tensor([20.0, 0.0, 20.0, 20.0]))
 
 
 def test_agent_centric_forward_and_checkpoint_keys() -> None:

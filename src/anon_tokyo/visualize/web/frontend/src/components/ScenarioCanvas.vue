@@ -180,11 +180,12 @@ function drawWorldLine(ctx: CanvasRenderingContext2D, points: number[][], color:
 
 function mapStyle(type: number, theme: Theme) {
   const t = Math.round(type)
-  if (t === 0 || t === 15 || t === 16) return { color: theme.mapCurb, width: 1.8, dash: [] }
-  if (t === 6) return { color: theme.mapStop, width: 1.7, dash: [] }
-  if (t === 3 || t === 8 || t === 9 || t === 10) return { color: theme.mapSolid, width: 1.5, dash: [6, 6] }
-  if (t === 1 || t === 4) return { color: theme.centerline, width: 1.2, dash: [1.5, 4.5] }
-  if (t === 2 || t === 5 || t === 7) return { color: theme.mapSolid, width: 1.5, dash: [] }
+  if (t === 1 || t === 2 || t === 3) return { color: theme.centerline, width: 1.2, dash: [1.5, 4.5] }
+  if (t === 6 || t === 9 || t === 10) return { color: theme.mapSolid, width: 1.5, dash: [6, 6] }
+  if (t === 7 || t === 8 || t === 11 || t === 12 || t === 13) return { color: theme.mapSolid, width: 1.5, dash: [] }
+  if (t === 15 || t === 16) return { color: theme.mapCurb, width: 1.8, dash: [] }
+  if (t === 17) return { color: theme.mapStop, width: 1.7, dash: [] }
+  if (t === 18 || t === 19) return { color: theme.mapStop, width: 1.3, dash: [3, 3] }
   return { color: theme.mapOther, width: 1.2, dash: [] }
 }
 
@@ -222,7 +223,12 @@ function drawWorldCircle(ctx: CanvasRenderingContext2D, point: number[], color: 
   ctx.restore()
 }
 
-function agentColor(agent: Agent, theme: Theme, goalReached = false, collision = false, offroad = false): string {
+function isSimulationHistoryFrame() {
+  return props.scenario?.sim_start_frame !== undefined && props.frame < props.scenario.sim_start_frame
+}
+
+function agentColor(agent: Agent, theme: Theme, goalReached = false, collision = false, offroad = false, logReplay = false): string {
+  if (logReplay) return theme.npc
   if (collision) return theme.collision
   if (offroad) return theme.offroad
   if (goalReached) return theme.target
@@ -337,13 +343,14 @@ function drawAgentBox(
   state?: { position: number[]; heading?: number } | null,
   goalReached = false,
   collision = false,
-  offroad = false
+  offroad = false,
+  logReplay = false
 ) {
   const [x, y] = state?.position ?? agent.position
   const [lengthRaw, widthRaw] = agent.size ?? [4.5, 2.0]
   const length = Math.max(lengthRaw ?? 4.5, agent.type === 'pedestrian' ? 0.8 : 2.0)
   const width = Math.max(widthRaw ?? 2.0, agent.type === 'pedestrian' ? 0.6 : 1.0)
-  const color = agentColor(agent, theme, goalReached, collision, offroad)
+  const color = agentColor(agent, theme, goalReached, collision, offroad, logReplay)
 
   ctx.save()
   ctx.translate(x ?? 0, y ?? 0)
@@ -366,7 +373,7 @@ function drawAgentBox(
   ctx.fill()
   ctx.restore()
 
-  if (selected || agent.sdc || agent.controlled || agent.target) {
+  if (!logReplay && (selected || agent.sdc || agent.controlled || agent.target)) {
     drawFlippedLabel(ctx, `${agent.id}`, (x ?? 0) + width, (y ?? 0) + width, color)
   }
 }
@@ -450,8 +457,9 @@ function draw() {
   })
   drawPredictions(ctx, scenario, theme)
   const rolloutByAgent = new Map((scenario.rollout ?? []).map((track) => [track.agent_id, track]))
+  const logReplayFrame = isSimulationHistoryFrame()
   scenario.rollout
-    ?.filter((track) => track.controlled && track.goal)
+    ?.filter((track) => !logReplayFrame && track.controlled && track.goal)
     .forEach((track) => {
       const reached = isGoalReached(track, props.frame)
       if (reached) return
@@ -471,9 +479,10 @@ function draw() {
       agent,
       theme,
       state,
-      isGoalReached(track, props.frame),
-      hasCollision(track, props.frame),
-      hasOffroad(track, props.frame)
+      !logReplayFrame && isGoalReached(track, props.frame),
+      !logReplayFrame && hasCollision(track, props.frame),
+      !logReplayFrame && hasOffroad(track, props.frame),
+      logReplayFrame
     )
   })
   ctx.restore()

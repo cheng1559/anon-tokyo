@@ -55,6 +55,18 @@ def _as_optional_list(value: Tensor, digits: int = 4) -> list[float | None]:
     return [round(float(item.item()), digits) if bool(torch.isfinite(item)) else None for item in flat]
 
 
+def _sample_int(batch: dict[str, Any], key: str, sample_idx: int) -> int | None:
+    value = batch.get(key)
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        item = value[sample_idx] if value.ndim > 0 else value
+        return int(_cpu(item).item())
+    if isinstance(value, list):
+        return int(value[sample_idx])
+    return int(value)
+
+
 def _valid_lines(polylines: Tensor, mask: Tensor, max_lines: int | None = None) -> list[dict[str, Any]]:
     lines = []
     valid = mask.bool()
@@ -338,6 +350,11 @@ def serialize_simulation_batch(
         )
     for sample_idx in range(batch_size):
         scenario = _scenario_base(batch, sample_idx, max_map_lines=max_map_lines)
+        for agent in scenario["agents"]:
+            agent["history"] = []
+        current_frame = _sample_int(batch, "current_time_index", sample_idx)
+        if current_frame is not None:
+            scenario["sim_start_frame"] = current_frame + 1
         if rollout_metric_tensors is not None:
             scenario["metrics"] = serializable_world_metrics(rollout_metric_tensors, sample_idx)
         if rollout_positions is not None:
