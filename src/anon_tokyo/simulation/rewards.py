@@ -47,6 +47,36 @@ class RewardConfig:
     comfort_lat_jerk: float = 2.0
 
 
+def _type_mask(types: Tensor, values: tuple[int, ...]) -> Tensor:
+    mask = torch.zeros_like(types, dtype=torch.bool)
+    for value in values:
+        mask = mask | (types == value)
+    return mask
+
+
+def _map_segments(map_polylines: Tensor, map_mask: Tensor, values: tuple[int, ...]) -> dict[str, Tensor]:
+    B = map_polylines.shape[0]
+    types = map_polylines[..., 6].round().long()
+    point_mask = map_mask.bool() & _type_mask(types, values)
+    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
+    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+    return {
+        "starts": starts,
+        "ends": ends,
+        "seg_min": torch.minimum(starts, ends),
+        "seg_max": torch.maximum(starts, ends),
+        "valid": (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1),
+    }
+
+
+def build_reward_map_cache(map_polylines: Tensor, map_mask: Tensor) -> dict[str, dict[str, Tensor]]:
+    return {
+        "road_edge": _map_segments(map_polylines, map_mask, ROAD_EDGE_TYPES),
+        "lane_center": _map_segments(map_polylines, map_mask, LANE_CENTER_TYPES),
+        "solid_line": _map_segments(map_polylines, map_mask, SOLID_LINE_TYPES),
+    }
+
+
 def agent_polygons(positions: Tensor, headings: Tensor, sizes: Tensor) -> Tensor:
     """Build oriented rectangle corners for agents."""
     half_l = sizes[..., 0].clamp_min(0.1) * 0.5
@@ -68,31 +98,31 @@ def agent_polygons(positions: Tensor, headings: Tensor, sizes: Tensor) -> Tensor
 def _rectangle_overlap(polygons: Tensor, valid: Tensor) -> Tensor:
     """Pairwise oriented rectangle overlap using SAT."""
     B, A, _, _ = polygons.shape
-    edges = torch.stack(
-        (
-            polygons[:, :, 1] - polygons[:, :, 0],
-            polygons[:, :, 3] - polygons[:, :, 0],
-        ),
-        dim=2,
-    )
-    axes = edges / edges.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    axes_i = axes[:, :, None].expand(B, A, A, 2, 2)
-    axes_j = axes[:, None, :].expand(B, A, A, 2, 2)
-    pair_axes = torch.cat((axes_i, axes_j), dim=3)
-
-    poly_i = polygons[:, :, None, None]
-    poly_j = polygons[:, None, :, None]
-    axis = pair_axes.unsqueeze(-2)
-    proj_i = (poly_i * axis).sum(dim=-1)
-    proj_j = (poly_j * axis).sum(dim=-1)
-    min_i, max_i = proj_i.amin(dim=-1), proj_i.amax(dim=-1)
-    min_j, max_j = proj_j.amin(dim=-1), proj_j.amax(dim=-1)
-    overlap = (max_i >= min_j) & (max_j >= min_i)
-    pair_overlap = overlap.all(dim=-1)
-
     pair_valid = valid[:, :, None] & valid[:, None, :]
     eye = torch.eye(A, dtype=torch.bool, device=polygons.device).unsqueeze(0)
-    return pair_overlap & pair_valid & ~eye
+    poly_min = polygons.amin(dim=2)
+    poly_max = polygons.amax(dim=2)
+    candidate = pair_valid & ~eye
+    candidate = candidate & (poly_max[:, :, None, 0] >= poly_min[:, None, :, 0]) & (poly_min[:, :, None, 0] <= poly_max[:, None, :, 0])
+    candidate = candidate & (poly_max[:, :, None, 1] >= poly_min[:, None, :, 1]) & (poly_min[:, :, None, 1] <= poly_max[:, None, :, 1])
+    pair_overlap = torch.zeros(B, A, A, dtype=torch.bool, device=polygons.device)
+    if not candidate.any():
+        return pair_overlap
+
+    batch_idx, i_idx, j_idx = candidate.nonzero(as_tuple=True)
+    poly_i = polygons[batch_idx, i_idx]
+    poly_j = polygons[batch_idx, j_idx]
+    edges_i = torch.stack((poly_i[:, 1] - poly_i[:, 0], poly_i[:, 3] - poly_i[:, 0]), dim=1)
+    edges_j = torch.stack((poly_j[:, 1] - poly_j[:, 0], poly_j[:, 3] - poly_j[:, 0]), dim=1)
+    axes = torch.cat((edges_i, edges_j), dim=1)
+    axes = axes / axes.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    proj_i = (poly_i[:, None] * axes[:, :, None]).sum(dim=-1)
+    proj_j = (poly_j[:, None] * axes[:, :, None]).sum(dim=-1)
+    min_i, max_i = proj_i.amin(dim=-1), proj_i.amax(dim=-1)
+    min_j, max_j = proj_j.amin(dim=-1), proj_j.amax(dim=-1)
+    exact = ((max_i >= min_j) & (max_j >= min_i)).all(dim=-1)
+    pair_overlap[batch_idx, i_idx, j_idx] = exact
+    return pair_overlap
 
 
 def _points_in_convex_polygon(points: Tensor, polygons: Tensor, eps: float = 1e-6) -> Tensor:
@@ -123,6 +153,36 @@ def _segment_polygon_intersection(segments: Tensor, polygons: Tensor) -> Tensor:
     p1 = torch.roll(polygons, shifts=-1, dims=1)
     edge_hit = _segments_intersect(s0[:, None], s1[:, None], p0, p1).any(dim=-1)
     return inside | edge_hit
+
+
+def _batched_segment_polygon_hits(
+    flat_segments: Tensor,
+    polygons: Tensor,
+    seg_valid: Tensor,
+    seg_min: Tensor | None = None,
+    seg_max: Tensor | None = None,
+) -> Tensor:
+    """Intersection of same-query segments ``[Q,S,2,2]`` with polygons ``[Q,4,2]``."""
+    q, s = flat_segments.shape[:2]
+    hits = torch.zeros(q, s, dtype=torch.bool, device=flat_segments.device)
+    if q == 0 or s == 0:
+        return hits
+
+    if seg_min is None:
+        seg_min = flat_segments.amin(dim=2)
+    if seg_max is None:
+        seg_max = flat_segments.amax(dim=2)
+    poly_min = polygons.amin(dim=1).unsqueeze(1)
+    poly_max = polygons.amax(dim=1).unsqueeze(1)
+    candidate = seg_valid & (seg_max[..., 0] >= poly_min[..., 0]) & (seg_min[..., 0] <= poly_max[..., 0])
+    candidate = candidate & (seg_max[..., 1] >= poly_min[..., 1]) & (seg_min[..., 1] <= poly_max[..., 1])
+    if not candidate.any():
+        return hits
+
+    query_idx, seg_idx = candidate.nonzero(as_tuple=True)
+    exact = _segment_polygon_intersection(flat_segments[query_idx, seg_idx], polygons[query_idx])
+    hits[query_idx, seg_idx] = exact
+    return hits
 
 
 def _expand_polygon_with_buffer(polygons: Tensor, width_buffer: float, length_buffer: float) -> Tensor:
@@ -192,8 +252,73 @@ def _batched_point_segment_distance(points: Tensor, start: Tensor, end: Tensor, 
     return dist.masked_fill(~seg_valid[:, None], float("inf"))
 
 
+def _nearby_segment_mask(
+    points: Tensor,
+    start: Tensor,
+    end: Tensor,
+    seg_valid: Tensor,
+    threshold: float,
+    seg_min: Tensor | None = None,
+    seg_max: Tensor | None = None,
+) -> Tensor:
+    if points.shape[0] == 0 or start.shape[1] == 0:
+        return seg_valid
+    threshold = max(float(threshold), 0.0)
+    point_min = points.amin(dim=1).unsqueeze(1) - threshold
+    point_max = points.amax(dim=1).unsqueeze(1) + threshold
+    if seg_min is None:
+        seg_min = torch.minimum(start, end)
+    if seg_max is None:
+        seg_max = torch.maximum(start, end)
+    nearby = (seg_max[..., 0] >= point_min[..., 0]) & (seg_min[..., 0] <= point_max[..., 0])
+    nearby = nearby & (seg_max[..., 1] >= point_min[..., 1]) & (seg_min[..., 1] <= point_max[..., 1])
+    return seg_valid & nearby
+
+
+def _batched_sparse_point_segment_min_distance(
+    points: Tensor,
+    start: Tensor,
+    end: Tensor,
+    seg_valid: Tensor,
+    threshold: float,
+    seg_min: Tensor | None = None,
+    seg_max: Tensor | None = None,
+) -> Tensor:
+    """Minimum point-segment distance, computing only threshold-AABB candidates."""
+    q = points.shape[0]
+    min_dist = points.new_full((q,), float("inf"))
+    candidate = _nearby_segment_mask(points, start, end, seg_valid, threshold, seg_min=seg_min, seg_max=seg_max)
+    if not candidate.any():
+        return min_dist
+
+    query_idx, seg_idx = candidate.nonzero(as_tuple=True)
+    seg_start = start[query_idx, seg_idx]
+    seg_end = end[query_idx, seg_idx]
+    seg = seg_end - seg_start
+    rel = points[query_idx] - seg_start[:, None]
+    denom = (seg * seg).sum(dim=-1).clamp_min(1e-7)
+    u = ((rel * seg[:, None]).sum(dim=-1) / denom[:, None]).clamp(0.0, 1.0)
+    proj = seg_start[:, None] + u[..., None] * seg[:, None]
+    cand_dist = (points[query_idx] - proj).norm(dim=-1).amin(dim=-1)
+    return min_dist.scatter_reduce(0, query_idx, cand_dist, reduce="amin", include_self=True)
+
+
 def _profile(profiler: TimingProfiler | None, name: str):
     return profiler.record(name) if profiler is not None else nullcontext()
+
+
+def _segments_from_cache(
+    map_polylines: Tensor,
+    map_mask: Tensor,
+    values: tuple[int, ...],
+    map_cache: dict[str, dict[str, Tensor]] | None,
+    cache_key: str,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if map_cache is not None and cache_key in map_cache:
+        cached = map_cache[cache_key]
+        return cached["starts"], cached["ends"], cached["valid"], cached["seg_min"], cached["seg_max"]
+    segments = _map_segments(map_polylines, map_mask, values)
+    return segments["starts"], segments["ends"], segments["valid"], segments["seg_min"], segments["seg_max"]
 
 
 def offroad_reward(
@@ -204,6 +329,7 @@ def offroad_reward(
     map_mask: Tensor,
     cfg: RewardConfig,
     profiler: TimingProfiler | None = None,
+    map_cache: dict[str, dict[str, Tensor]] | None = None,
 ):
     B, A = valid.shape
     out = torch.zeros(B, A, dtype=torch.bool, device=valid.device)
@@ -213,24 +339,24 @@ def offroad_reward(
         return out.float() * cfg.offroad_reward_weight, out
 
     with _profile(profiler, "reward.offroad.prepare_map"):
-        types = map_polylines[..., 6].round().long()
-        boundary_values = torch.tensor(ROAD_EDGE_TYPES, dtype=types.dtype, device=types.device)
-        boundary_type = torch.isin(types, boundary_values)
-        point_mask = map_mask.bool() & boundary_type
-        seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
-        starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
-        ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+        starts, ends, seg_valid, seg_min, seg_max = _segments_from_cache(map_polylines, map_mask, ROAD_EDGE_TYPES, map_cache, "road_edge")
 
     with _profile(profiler, "reward.offroad.distance"):
         agent_polys = polygons[batch_idx, agent_idx]
         agent_points = torch.cat((agent_polys, agent_polys.mean(dim=1, keepdim=True)), dim=1)
-        dist = _batched_point_segment_distance(
+        starts_active = starts[batch_idx]
+        ends_active = ends[batch_idx]
+        seg_min_active = seg_min[batch_idx]
+        seg_max_active = seg_max[batch_idx]
+        min_dist = _batched_sparse_point_segment_min_distance(
             agent_points,
-            starts[batch_idx],
-            ends[batch_idx],
+            starts_active,
+            ends_active,
             seg_valid[batch_idx],
+            cfg.offroad_distance_threshold,
+            seg_min=seg_min_active,
+            seg_max=seg_max_active,
         )
-        min_dist = dist.amin(dim=2).amin(dim=1)
         out[batch_idx, agent_idx] = min_dist <= cfg.offroad_distance_threshold
 
     reward = out.float() * cfg.offroad_reward_weight
@@ -272,22 +398,26 @@ def _compute_ttc(polygons: Tensor, positions: Tensor, velocities: Tensor, headin
     v2 = _eval_velocity_with_heading_fallback(velocities[pair_batch, other_agent], headings[pair_batch, other_agent], False, cfg)
     rel_v = v2 - v1
     horizon = positions.new_full((pair_batch.numel(),), cfg.ttc_horizon)
-    ego_for_segments = ego_poly.unsqueeze(1).expand(-1, 6, -1, -1).reshape(-1, 4, 2)
-
-    def collision_at_time(t_vec: Tensor) -> Tensor:
-        segments = _motion_segments(other_poly, rel_v * t_vec.unsqueeze(-1)).reshape(-1, 2, 2)
+    def collision_at_time(t_vec: Tensor, idx: Tensor | None = None) -> Tensor:
+        cur_other_poly = other_poly if idx is None else other_poly[idx]
+        cur_ego_poly = ego_poly if idx is None else ego_poly[idx]
+        cur_rel_v = rel_v if idx is None else rel_v[idx]
+        segments = _motion_segments(cur_other_poly, cur_rel_v * t_vec.unsqueeze(-1)).reshape(-1, 2, 2)
+        ego_for_segments = cur_ego_poly.unsqueeze(1).expand(-1, 6, -1, -1).reshape(-1, 4, 2)
         return _segment_polygon_intersection(segments, ego_for_segments).view(-1, 6).any(dim=-1)
 
     active = collision_at_time(horizon)
-    low = torch.zeros_like(horizon)
-    high = horizon.clone()
-    for _ in range(cfg.ttc_num_iters):
-        mid = 0.5 * (low + high)
-        hit = collision_at_time(mid)
-        high = torch.where(active & hit, mid, high)
-        low = torch.where(active & ~hit, mid, low)
-
-    t_pair = torch.where(active, high, horizon)
+    t_pair = horizon.clone()
+    if active.any():
+        active_idx = active.nonzero(as_tuple=True)[0]
+        low = torch.zeros_like(horizon[active_idx])
+        high = horizon[active_idx].clone()
+        for _ in range(cfg.ttc_num_iters):
+            mid = 0.5 * (low + high)
+            hit = collision_at_time(mid, active_idx)
+            high = torch.where(hit, mid, high)
+            low = torch.where(~hit, mid, low)
+        t_pair[active_idx] = high
     t_min = torch.full((batch_idx.numel(),), float("inf"), device=positions.device, dtype=positions.dtype)
     t_min = t_min.scatter_reduce(0, controlled_flat, t_pair, reduce="amin", include_self=True)
     ttc[batch_idx, agent_idx] = torch.minimum(t_min, positions.new_full(t_min.shape, cfg.ttc_horizon))
@@ -315,6 +445,7 @@ def tto_reward(
     map_polylines: Tensor,
     map_mask: Tensor,
     cfg: RewardConfig,
+    map_cache: dict[str, dict[str, Tensor]] | None = None,
 ):
     B, A = valid.shape
     tto = positions.new_full((B, A), cfg.tto_horizon)
@@ -323,12 +454,7 @@ def tto_reward(
     if batch_idx.numel() == 0:
         return torch.ones_like(tto), torch.zeros_like(active), tto
 
-    types = map_polylines[..., 6].round().long()
-    edge_values = torch.tensor(ROAD_EDGE_TYPES, dtype=types.dtype, device=types.device)
-    point_mask = map_mask.bool() & torch.isin(types, edge_values)
-    seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
-    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
-    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+    starts, ends, seg_valid, seg_min, seg_max = _segments_from_cache(map_polylines, map_mask, ROAD_EDGE_TYPES, map_cache, "road_edge")
     if not seg_valid.any():
         return torch.ones_like(tto), torch.zeros_like(active), tto
 
@@ -337,6 +463,7 @@ def tto_reward(
     poly = _expand_polygon_with_buffer(polygons[batch_idx, agent_idx], cfg.ttc_radius_buffer, cfg.ttc_radius_buffer)
     horizon = positions.new_full((batch_idx.numel(),), cfg.tto_horizon)
     ctrl_heading = headings[batch_idx, agent_idx]
+    ctrl_heading_dir = heading_dir[batch_idx, agent_idx]
     ctrl_speed = speed[batch_idx, agent_idx]
     ctrl_steering = steering[batch_idx, agent_idx]
     wheelbase = get_wheelbase_from_length(sizes[batch_idx, agent_idx, 0]).clamp_min(1e-6)
@@ -346,38 +473,53 @@ def tto_reward(
     curvature_safe = curvature_sign * curvature.abs().clamp_min(1e-4)
     left_normal = torch.stack((-ctrl_heading.sin(), ctrl_heading.cos()), dim=-1)
     icr = poly.mean(dim=1) + left_normal / curvature_safe.unsqueeze(-1)
+    flat_segments = torch.stack((starts[batch_idx], ends[batch_idx]), dim=2)
+    seg_valid_active = seg_valid[batch_idx]
+    seg_min_active = seg_min[batch_idx]
+    seg_max_active = seg_max[batch_idx]
 
-    def future_polygon(t_vec: Tensor) -> Tensor:
-        straight_delta = heading_dir[batch_idx, agent_idx] * (ctrl_speed * t_vec).unsqueeze(-1)
-        straight_poly = poly + straight_delta.unsqueeze(1)
-        delta_yaw = ctrl_speed * curvature_safe * t_vec
-        rel = poly - icr.unsqueeze(1)
+    def future_polygon(t_vec: Tensor, idx: Tensor | None = None) -> Tensor:
+        cur_heading_dir = ctrl_heading_dir if idx is None else ctrl_heading_dir[idx]
+        cur_speed = ctrl_speed if idx is None else ctrl_speed[idx]
+        cur_poly = poly if idx is None else poly[idx]
+        cur_curvature = curvature_safe if idx is None else curvature_safe[idx]
+        cur_icr = icr if idx is None else icr[idx]
+        cur_straight = straight if idx is None else straight[idx]
+        straight_delta = cur_heading_dir * (cur_speed * t_vec).unsqueeze(-1)
+        straight_poly = cur_poly + straight_delta.unsqueeze(1)
+        delta_yaw = cur_speed * cur_curvature * t_vec
+        rel = cur_poly - cur_icr.unsqueeze(1)
         cos_yaw = torch.cos(delta_yaw).unsqueeze(-1)
         sin_yaw = torch.sin(delta_yaw).unsqueeze(-1)
         rel_x = rel[..., 0]
         rel_y = rel[..., 1]
         curved_rel = torch.stack((cos_yaw * rel_x - sin_yaw * rel_y, sin_yaw * rel_x + cos_yaw * rel_y), dim=-1)
-        curved_poly = icr.unsqueeze(1) + curved_rel
-        return torch.where(straight[:, None, None], straight_poly, curved_poly)
+        curved_poly = cur_icr.unsqueeze(1) + curved_rel
+        return torch.where(cur_straight[:, None, None], straight_poly, curved_poly)
 
-    def collision_at_time(t_vec: Tensor) -> Tensor:
-        future_poly = future_polygon(t_vec)
-        flat_segments = torch.stack((starts[batch_idx], ends[batch_idx]), dim=2)
-        num_segments = flat_segments.shape[1]
-        repeated_poly = future_poly.unsqueeze(1).expand(-1, num_segments, -1, -1).reshape(-1, 4, 2)
-        hits = _segment_polygon_intersection(flat_segments.reshape(-1, 2, 2), repeated_poly).view(-1, num_segments)
-        return (hits & seg_valid[batch_idx]).any(dim=-1)
+    def collision_at_time(t_vec: Tensor, idx: Tensor | None = None) -> Tensor:
+        future_poly = future_polygon(t_vec, idx)
+        cur_segments = flat_segments if idx is None else flat_segments[idx]
+        cur_valid = seg_valid_active if idx is None else seg_valid_active[idx]
+        cur_min = seg_min_active if idx is None else seg_min_active[idx]
+        cur_max = seg_max_active if idx is None else seg_max_active[idx]
+        hits = _batched_segment_polygon_hits(cur_segments, future_poly, cur_valid, cur_min, cur_max)
+        return hits.any(dim=-1)
 
     active_h = collision_at_time(horizon)
-    low = torch.zeros_like(horizon)
-    high = horizon.clone()
-    for _ in range(cfg.tto_num_iters):
-        mid = 0.5 * (low + high)
-        hit = collision_at_time(mid)
-        high = torch.where(active_h & hit, mid, high)
-        low = torch.where(active_h & ~hit, mid, low)
+    tto_active = horizon.clone()
+    if active_h.any():
+        active_idx = active_h.nonzero(as_tuple=True)[0]
+        low = torch.zeros_like(horizon[active_idx])
+        high = horizon[active_idx].clone()
+        for _ in range(cfg.tto_num_iters):
+            mid = 0.5 * (low + high)
+            hit = collision_at_time(mid, active_idx)
+            high = torch.where(hit, mid, high)
+            low = torch.where(~hit, mid, low)
+        tto_active[active_idx] = high
 
-    tto[batch_idx, agent_idx] = torch.where(active_h, high, horizon)
+    tto[batch_idx, agent_idx] = tto_active
     alert = (tto < cfg.tto_horizon) & controlled & valid
     score = cfg.tto_reward_floor + (1.0 - cfg.tto_reward_floor) * (tto / cfg.tto_horizon).clamp(0.0, 1.0)
     return torch.where(alert, score, torch.ones_like(score)), alert, tto
@@ -399,6 +541,7 @@ def centerline_reward(
     map_polylines: Tensor,
     map_mask: Tensor,
     cfg: RewardConfig,
+    map_cache: dict[str, dict[str, Tensor]] | None = None,
 ):
     B, A = valid.shape
     min_dist = positions.new_full((B, A), float("inf"))
@@ -407,12 +550,7 @@ def centerline_reward(
     if batch_idx.numel() == 0:
         return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist
 
-    types = map_polylines[..., 6].round().long()
-    center_values = torch.tensor(LANE_CENTER_TYPES, dtype=types.dtype, device=types.device)
-    point_mask = map_mask.bool() & torch.isin(types, center_values)
-    seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
-    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
-    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+    starts, ends, seg_valid, _, _ = _segments_from_cache(map_polylines, map_mask, LANE_CENTER_TYPES, map_cache, "lane_center")
     if not seg_valid.any():
         return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist
 
@@ -437,6 +575,7 @@ def solid_line_reward(
     map_polylines: Tensor,
     map_mask: Tensor,
     cfg: RewardConfig,
+    map_cache: dict[str, dict[str, Tensor]] | None = None,
 ):
     B, A = valid.shape
     crossed = torch.zeros(B, A, dtype=torch.bool, device=valid.device)
@@ -445,21 +584,13 @@ def solid_line_reward(
     if batch_idx.numel() == 0:
         return polygons.new_ones(B, A), crossed
 
-    types = map_polylines[..., 6].round().long()
-    solid_values = torch.tensor(SOLID_LINE_TYPES, dtype=types.dtype, device=types.device)
-    point_mask = map_mask.bool() & torch.isin(types, solid_values)
-    seg_valid = (point_mask[:, :, :-1] & point_mask[:, :, 1:]).flatten(1)
-    starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
-    ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
+    starts, ends, seg_valid, seg_min, seg_max = _segments_from_cache(map_polylines, map_mask, SOLID_LINE_TYPES, map_cache, "solid_line")
     if not seg_valid.any():
         return polygons.new_ones(B, A), crossed
 
     poly = _expand_polygon_with_buffer(polygons[batch_idx, agent_idx], cfg.solid_line_distance_threshold, 0.0)
     flat_segments = torch.stack((starts[batch_idx], ends[batch_idx]), dim=2)
-    num_segments = flat_segments.shape[1]
-    repeated_poly = poly.unsqueeze(1).expand(-1, num_segments, -1, -1).reshape(-1, 4, 2)
-    hits = _segment_polygon_intersection(flat_segments.reshape(-1, 2, 2), repeated_poly).view(-1, num_segments)
-    crossed_active = (hits & seg_valid[batch_idx]).any(dim=-1)
+    crossed_active = _batched_segment_polygon_hits(flat_segments, poly, seg_valid[batch_idx], seg_min[batch_idx], seg_max[batch_idx]).any(dim=-1)
     crossed[batch_idx, agent_idx] = crossed_active
     score = polygons.new_ones(B, A)
     score[batch_idx, agent_idx] = torch.where(crossed_active, polygons.new_full(crossed_active.shape, cfg.solid_line_weight), score[batch_idx, agent_idx])
@@ -491,6 +622,7 @@ def compute_rewards(
         obj_types = obj_types.to(device=valid.device).long()
     vehicle_mask = obj_types == VEHICLE_TYPE
     vulnerable_mask = (obj_types == PEDESTRIAN_TYPE) | (obj_types == CYCLIST_TYPE)
+    map_cache = state.get("reward_map_cache")
     with _profile(profiler, "reward.collision"):
         collision_r, collision, pair_collision, polygons = collision_reward(
             state["positions"], state["headings"], state["sizes"], valid, controlled, cfg
@@ -504,6 +636,7 @@ def compute_rewards(
             state["map_polylines_mask"],
             cfg,
             profiler=profiler,
+            map_cache=map_cache,
         )
     with _profile(profiler, "reward.ttc"):
         ttc_score, ttc_alert, ttc = ttc_reward(
@@ -522,6 +655,7 @@ def compute_rewards(
             state["map_polylines"],
             state["map_polylines_mask"],
             cfg,
+            map_cache=map_cache,
         )
     with _profile(profiler, "reward.goal"):
         goal_r, goal_first, next_goal_reached, goal_dist = goal_reaching_reward(
@@ -535,6 +669,7 @@ def compute_rewards(
             state["map_polylines"],
             state["map_polylines_mask"],
             cfg,
+            map_cache=map_cache,
         )
     with _profile(profiler, "reward.solid_line"):
         solid_line_score, solid_line_crossed = solid_line_reward(
@@ -544,6 +679,7 @@ def compute_rewards(
             state["map_polylines"],
             state["map_polylines_mask"],
             cfg,
+            map_cache=map_cache,
         )
     with _profile(profiler, "reward.comfort"):
         comfort_score = comfort_reward(

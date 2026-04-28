@@ -11,7 +11,7 @@ from torch import Tensor
 
 from anon_tokyo.simulation.dynamics import JerkPncConfig, JerkPncModel, infer_log_kinematics
 from anon_tokyo.simulation.profiling import TimingProfiler
-from anon_tokyo.simulation.rewards import RewardConfig, compute_rewards
+from anon_tokyo.simulation.rewards import RewardConfig, build_reward_map_cache, compute_rewards
 
 
 @dataclass
@@ -76,6 +76,7 @@ class ClosedLoopEnv:
         self.done: Tensor | None = None
         self.goal_reached: Tensor | None = None
         self.goal_positions: Tensor | None = None
+        self.reward_map_cache: dict[str, dict[str, Tensor]] | None = None
 
         self.positions: Tensor | None = None
         self.velocities: Tensor | None = None
@@ -155,6 +156,8 @@ class ClosedLoopEnv:
             self.goal_reached = torch.zeros_like(controlled, dtype=torch.bool)
         with self._profile("env.reset.sample_goals"):
             self.goal_positions = self._sample_goals()
+        with self._profile("env.reset.reward_map_cache"):
+            self.reward_map_cache = build_reward_map_cache(self.batch["map_polylines"], self.batch["map_polylines_mask"])
         return self.get_obs()
 
     def _set_dt(self, timestamps: Tensor | None) -> None:
@@ -328,7 +331,7 @@ class ClosedLoopEnv:
         assert self.positions is not None and self.velocities is not None and self.headings is not None
         assert self.sizes is not None and self.valid is not None and self.a_long is not None
         assert self.a_lat is not None and self.jerk_long is not None and self.jerk_lat is not None
-        assert self.controlled_mask is not None
+        assert self.controlled_mask is not None and self.reward_map_cache is not None
         return {
             "positions": self.positions[:, :, -1],
             "prev_positions": self.positions[:, :, -2] if self.positions.shape[2] >= 2 else self.positions[:, :, -1],
@@ -340,6 +343,7 @@ class ClosedLoopEnv:
             "obj_types": self.batch["obj_types"],
             "map_polylines": self.batch["map_polylines"],
             "map_polylines_mask": self.batch["map_polylines_mask"],
+            "reward_map_cache": self.reward_map_cache,
             "goal_positions": self.goal_positions,
             "goal_reached": self.goal_reached,
             "a_long": self.a_long[:, :, -1],
