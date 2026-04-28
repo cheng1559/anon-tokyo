@@ -73,16 +73,21 @@ def _select_scene_agents(
     sdc_idx: int,
     max_agents: int,
     history_len: int,
+    require_current_valid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Select and reindex scene agents with the same priority as scene transform."""
     num_agents = valid.shape[0]
     hist_mask = valid[:, :history_len]
     has_history = hist_mask.any(axis=1)
+    current_valid = valid[:, history_len - 1] > 0
     valid_ttp = tracks_to_predict[(tracks_to_predict >= 0) & (tracks_to_predict < num_agents)]
 
     keep = has_history.copy().astype(bool)
+    if require_current_valid:
+        keep &= current_valid
+        valid_ttp = valid_ttp[current_valid[valid_ttp]]
     keep[valid_ttp] = True
-    if 0 <= sdc_idx < num_agents:
+    if 0 <= sdc_idx < num_agents and (not require_current_valid or current_valid[sdc_idx]):
         keep[sdc_idx] = True
     keep_idx = np.where(keep)[0]
 
@@ -165,6 +170,7 @@ def scene_centric_transform(
     vector_break_dist: float = 1.0,
     center_offset_of_map: tuple[float, float] = (30.0, 0.0),
     include_eval_meta: bool = False,
+    require_current_valid_agents: bool = False,
 ) -> dict[str, np.ndarray]:
     """Transform a raw scenario dict into scene-centric padded features."""
 
@@ -230,6 +236,7 @@ def scene_centric_transform(
         sdc_idx=sdc_idx,
         max_agents=max_agents,
         history_len=history_len,
+        require_current_valid=require_current_valid_agents,
     )
     n = len(keep_idx)
 
@@ -394,6 +401,7 @@ def simulation_transform(
         vector_break_dist=vector_break_dist,
         center_offset_of_map=center_offset_of_map,
         include_eval_meta=False,
+        require_current_valid_agents=True,
     )
 
     t, _, _, current_t, sdc_idx, num_timestamps = _transform_scene_trajs(data)
@@ -405,6 +413,7 @@ def simulation_transform(
         sdc_idx=sdc_idx,
         max_agents=max_agents,
         history_len=current_t + 1,
+        require_current_valid=True,
     )
 
     A = max_agents
