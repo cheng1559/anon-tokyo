@@ -9,7 +9,6 @@ model:
     max_context_agents: 16
     max_lanes: 96
     history_steps: 5
-    enable_occupancy_grid: true
     use_layer_norm_layout: true
     agent_filter_radius: 200.0
     topk_front_weight: 10.0

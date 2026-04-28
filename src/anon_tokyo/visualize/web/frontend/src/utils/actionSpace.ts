@@ -160,17 +160,15 @@ export function reshape2D<T>(flat: T[], nLong: number, nLat: number, fill: T): T
 /** STEER_RATIO: steering wheel angle / tire angle (from vehicle_constants.py). */
 const STEER_RATIO = 12.6
 
+/** Tire-angle slew-rate cap still used by the dynamics as a physical limiter. */
+const MAX_TIRE_ANGLE_RATE_UPPER_BOUND = 0.3 * 0.7
+
 /** Steering angle limits in radians (from constants.py). */
 const MIN_STEERING_ANGLE = (-432 * Math.PI) / 180 / 12.6 // ≈ -0.5988 rad
 const MAX_STEERING_ANGLE = (432 * Math.PI) / 180 / 12.6 // ≈ +0.5988 rad
 
 /** Default dynamics constants (from jerk_pnc_model.py / constants.py). */
 const DEFAULTS = {
-    lateralModeTransitionSpeed: 5.0,
-    lateralModeTransitionWidth: 0.4,
-    maxTireAngleRateLowerBound: 0.03,
-    maxTireAngleRateUpperBound: 0.3 * 0.7,
-    maxTireAngleRateGain: 1.39 * 0.7,
     minALat: -3.0,
     maxALat: 3.0,
     minALong: -3.0,
@@ -181,12 +179,7 @@ const DEFAULTS = {
 }
 
 export type SteeringRateDynamicsConfig = {
-    lateralModeTransitionSpeed?: number
-    lateralModeTransitionWidth?: number
     lateralActionSpaceShapeGamma?: number
-    maxTireAngleRateLowerBound?: number
-    maxTireAngleRateUpperBound?: number
-    maxTireAngleRateGain?: number
     minALat?: number
     maxALat?: number
     minALong?: number
@@ -200,10 +193,6 @@ export type AgentDynamicsState = {
     steering: number
     acceleration: number
     wheelbase: number
-}
-
-function sigmoid(x: number): number {
-    return 1.0 / (1.0 + Math.exp(-x))
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -255,21 +244,18 @@ export function marginalizeLongitudinal(probs: number[], nLong: number, nLat: nu
  * Each token maps to a unique value, suitable for distribution visualization.
  */
 export function computeTargetWheelRateForLatAction(
-    latCommand: number,
+    jerkLatAction: number,
     state: AgentDynamicsState,
-    actionSpaceConfig: JerkPncActionSpaceConfig,
     dynamicsConfig?: SteeringRateDynamicsConfig,
     jerkLongAction?: number
 ): number {
     const cfg = { ...DEFAULTS, ...dynamicsConfig }
     const t = cfg.frameTimeInterval
-    const { speed, vLong, steering, acceleration, wheelbase } = state
-    const latCmdScale = Math.max(Math.abs(actionSpaceConfig.minJerkLat), Math.abs(actionSpaceConfig.maxJerkLat), 1e-3)
+    const { vLong, steering, acceleration, wheelbase } = state
 
-    // Branch A (high speed): lateral jerk → target lateral accel → curvature → steering
     const currentCurvature = Math.tan(steering) / wheelbase
     const currentALat = vLong * vLong * currentCurvature
-    let targetALat = currentALat + latCommand * t
+    let targetALat = currentALat + jerkLatAction * t
     targetALat = clamp(targetALat, cfg.minALat, cfg.maxALat)
 
     const jerkLong = jerkLongAction ?? 0
@@ -277,18 +263,7 @@ export function computeTargetWheelRateForLatAction(
     newAccel = clamp(newAccel, cfg.minALong, cfg.maxALong)
     const predVLong = clamp(vLong + 0.5 * (acceleration + newAccel) * t, cfg.minSpeed, cfg.maxSpeed)
     const targetCurvature = targetALat / Math.max(predVLong * predVLong, 1.0)
-    const targetSteeringJerk = Math.atan(targetCurvature * wheelbase)
-
-    // Branch B (low speed): normalized steering-rate command
-    // _lat_command_to_steering_rate: latCmdNorm * rateBound
-    const rateBound = clamp(cfg.maxTireAngleRateGain / Math.max(speed, 1e-3), cfg.maxTireAngleRateLowerBound, cfg.maxTireAngleRateUpperBound)
-    const latCmdNorm = clamp(latCommand / latCmdScale, -1.0, 1.0)
-    const steeringRateCmd = latCmdNorm * rateBound
-    const targetSteeringRate = steering + steeringRateCmd * t
-
-    // Blend by speed
-    const w = sigmoid((speed - cfg.lateralModeTransitionSpeed) / Math.max(cfg.lateralModeTransitionWidth ?? 0.4, 1e-3))
-    const targetSteering = w * targetSteeringJerk + (1 - w) * targetSteeringRate
+    const targetSteering = Math.atan(targetCurvature * wheelbase)
 
     // Return target rate in °/s (NO delta-bound or min/max clamping)
     return ((targetSteering - steering) / t) * (180 / Math.PI) * STEER_RATIO
@@ -303,7 +278,6 @@ export function computeTargetWheelRateDistribution(
     probs: number[],
     actionSpace: JerkPncActionSpace,
     state: AgentDynamicsState,
-    actionSpaceConfig: JerkPncActionSpaceConfig,
     dynamicsConfig?: SteeringRateDynamicsConfig
 ): { wheelRates: number[]; logProbs: number[] } {
     const { nLong, nLat, jerkLat, jerkLong } = actionSpace
@@ -319,7 +293,7 @@ export function computeTargetWheelRateDistribution(
 
     const pairs: [number, number][] = []
     for (let iLat = 0; iLat < nLat; iLat++) {
-        const wr = computeTargetWheelRateForLatAction(jerkLat[iLat] ?? 0, state, actionSpaceConfig, dynamicsConfig, bestJerkLong)
+        const wr = computeTargetWheelRateForLatAction(jerkLat[iLat] ?? 0, state, dynamicsConfig, bestJerkLong)
         const p = latMarginal[iLat] ?? 0
         pairs.push([wr, p > 0 ? Math.log10(p) : -30])
     }
@@ -331,12 +305,8 @@ export function computeTargetWheelRateDistribution(
     }
 }
 
-/** Max wheel rate in deg/s for chart axis range.
- *  Uses maxTireAngleRateUpperBound (0.21 rad/s) as the physical limit,
- *  with 2x margin to accommodate unclamped target rates.
- */
+/** Max wheel rate in deg/s for chart axis range. */
 export function getMaxWheelRate(): number {
-    const rateUpperBound = DEFAULTS.maxTireAngleRateUpperBound // 0.21 rad/s
-    return rateUpperBound * (180 / Math.PI) * STEER_RATIO
+    return MAX_TIRE_ANGLE_RATE_UPPER_BOUND * (180 / Math.PI) * STEER_RATIO
     // ≈ 0.21 * 57.3 * 12.6 ≈ 151.5 deg/s
 }
