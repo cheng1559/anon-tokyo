@@ -394,7 +394,6 @@ def goal_reaching_reward(positions: Tensor, goals: Tensor, goal_reached: Tensor,
 
 def centerline_reward(
     positions: Tensor,
-    headings: Tensor,
     valid: Tensor,
     controlled: Tensor,
     map_polylines: Tensor,
@@ -403,11 +402,10 @@ def centerline_reward(
 ):
     B, A = valid.shape
     min_dist = positions.new_full((B, A), float("inf"))
-    wrong_way = torch.zeros(B, A, dtype=torch.bool, device=positions.device)
     active = controlled & valid
     batch_idx, agent_idx = active.nonzero(as_tuple=True)
     if batch_idx.numel() == 0:
-        return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist, wrong_way
+        return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist
 
     types = map_polylines[..., 6].round().long()
     center_values = torch.tensor(LANE_CENTER_TYPES, dtype=types.dtype, device=types.device)
@@ -416,24 +414,20 @@ def centerline_reward(
     starts = map_polylines[:, :, :-1, 0:2].reshape(B, -1, 2)
     ends = map_polylines[:, :, 1:, 0:2].reshape(B, -1, 2)
     if not seg_valid.any():
-        return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist, wrong_way
+        return torch.ones(B, A, dtype=positions.dtype, device=positions.device), min_dist
 
     pts = positions[batch_idx, agent_idx].unsqueeze(1)
     dist = _batched_point_segment_distance(pts, starts[batch_idx], ends[batch_idx], seg_valid[batch_idx]).squeeze(1)
-    best_dist, best_idx = dist.min(dim=-1)
+    best_dist = dist.min(dim=-1).values
     min_dist[batch_idx, agent_idx] = best_dist
 
-    seg_vec = ends[batch_idx, best_idx] - starts[batch_idx, best_idx]
-    agent_dir = torch.stack((headings[batch_idx, agent_idx].cos(), headings[batch_idx, agent_idx].sin()), dim=-1)
     has_centerline = torch.isfinite(best_dist)
-    wrong = ((agent_dir * seg_vec).sum(dim=-1) < 0.0) & has_centerline
-    wrong_way[batch_idx, agent_idx] = wrong
 
     t = (best_dist / max(cfg.centerline_distance_limit, 1e-6)).clamp(0.0, 1.0)
     score_active = 1.0 - (1.0 - cfg.centerline_weight) * t
     score = torch.ones(B, A, dtype=positions.dtype, device=positions.device)
-    score[batch_idx, agent_idx] = torch.where(has_centerline, torch.where(wrong, positions.new_full(score_active.shape, cfg.solid_line_weight), score_active), torch.ones_like(score_active))
-    return score, min_dist, wrong_way
+    score[batch_idx, agent_idx] = torch.where(has_centerline, score_active, torch.ones_like(score_active))
+    return score, min_dist
 
 
 def solid_line_reward(
@@ -505,7 +499,7 @@ def compute_rewards(
         offroad_r, offroad = offroad_reward(
             polygons,
             valid,
-            controlled,
+            controlled & vehicle_mask,
             state["map_polylines"],
             state["map_polylines_mask"],
             cfg,
@@ -534,9 +528,8 @@ def compute_rewards(
             state["positions"], state["goal_positions"], state["goal_reached"], controlled, valid, cfg
         )
     with _profile(profiler, "reward.centerline"):
-        centerline_score, centerline_dist, wrong_way = centerline_reward(
+        centerline_score, centerline_dist = centerline_reward(
             state["positions"],
-            state["headings"],
             valid,
             controlled & vehicle_mask,
             state["map_polylines"],
@@ -558,7 +551,7 @@ def compute_rewards(
         )
 
     with _profile(profiler, "reward.combine"):
-        hard_reward = collision_r + torch.where(vehicle_mask, offroad_r, torch.zeros_like(offroad_r))
+        hard_reward = collision_r + offroad_r
         done = (collision | (offroad & vehicle_mask)) & controlled & valid
 
         vehicle_soft_score = comfort_score * ttc_score * tto_score * centerline_score * solid_line_score
@@ -580,7 +573,6 @@ def compute_rewards(
         "comfort_score": comfort_score,
         "centerline_score": centerline_score,
         "centerline_distance": centerline_dist,
-        "wrong_way": wrong_way,
         "solid_line_score": solid_line_score,
         "solid_line_crossed": solid_line_crossed,
         "collision_reward": collision_r,
