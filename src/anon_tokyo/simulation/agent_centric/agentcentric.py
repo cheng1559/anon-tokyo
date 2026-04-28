@@ -73,16 +73,6 @@ def _swap_ego_index(tensor: Tensor, persp_idx: Tensor) -> Tensor:
     return tensor.gather(1, perm.view(idx_shape).expand_as(tensor))
 
 
-def _remap_map_type_to_agentcentric(raw_type: Tensor) -> Tensor:
-    """Map project polyline types to agent-centric normalized lane boundary classes."""
-    road_edge = (raw_type == 15.0) | (raw_type == 16.0)
-    solid = (raw_type == 7.0) | (raw_type == 8.0) | (raw_type == 11.0) | (raw_type == 12.0)
-    out = torch.zeros_like(raw_type)
-    out = torch.where(road_edge, torch.ones_like(out), out)
-    out = torch.where(solid, torch.full_like(out, 2.0), out)
-    return out
-
-
 class AgentCentricNet(nn.Module):
     """Exact module layout for agent-centric checkpoints."""
 
@@ -99,7 +89,6 @@ class AgentCentricNet(nn.Module):
         no_goal_allowed: bool = True,
         max_agents: int | None = 16,
         history_steps: int = 5,
-        enable_occupancy_grid: bool = True,
         is_continuous: bool = True,
         use_layer_norm_layout: bool = False,
     ) -> None:
@@ -109,7 +98,6 @@ class AgentCentricNet(nn.Module):
         self.no_goal_allowed = no_goal_allowed
         self.max_agents = max_agents
         self.history_steps = history_steps
-        self.enable_occupancy_grid = enable_occupancy_grid
         self.is_continuous = is_continuous
 
         if history_steps > 1 and use_layer_norm_layout:
@@ -159,19 +147,6 @@ class AgentCentricNet(nn.Module):
                 nn.ReLU(),
                 _layer_init(nn.Linear(embed_dim, embed_dim)),
             )
-        if enable_occupancy_grid:
-            self.occ_conv = nn.Sequential(
-                _layer_init(nn.Conv1d(2, embed_dim // 8, kernel_size=5, stride=4, padding=2)),
-                nn.ReLU(),
-                _layer_init(nn.Conv1d(embed_dim // 8, embed_dim, kernel_size=3, stride=2, padding=1)),
-            )
-            if use_layer_norm_layout:
-                self.occ_conv.append(nn.GroupNorm(1, embed_dim))
-            self.occ_pool = nn.AdaptiveMaxPool1d(1)
-        else:
-            self.occ_conv = None
-            self.occ_pool = None
-
         self.agent_ln1 = nn.LayerNorm(embed_dim)
         self.agent_self_attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
         self.agent_ln2 = nn.LayerNorm(embed_dim)
@@ -212,8 +187,6 @@ class AgentCentricNet(nn.Module):
         agent_mask: Tensor,
         lane_bound_features: Tensor,
         lane_bound_mask: Tensor,
-        occ_points: Tensor,
-        occ_mask: Tensor,
         visible_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         b, a, _, _ = agent_features.shape
@@ -238,14 +211,6 @@ class AgentCentricNet(nn.Module):
         has_lanes = lane_mask.any(dim=1, keepdim=True)
         global_lane_embedding = torch.where(has_lanes, pooled_lane, self.default_lane_embedding.expand(b, 1, -1))
 
-        if self.enable_occupancy_grid and self.occ_conv is not None and self.occ_pool is not None:
-            occ_points_filled = torch.where(occ_mask.unsqueeze(-1), occ_points, torch.full_like(occ_points, -1.0))
-            occ_features = self.occ_pool(self.occ_conv(occ_points_filled.transpose(1, 2))).transpose(1, 2)
-            has_occ = occ_mask.any(dim=1, keepdim=True).unsqueeze(-1)
-            global_occ_embedding = torch.where(has_occ, occ_features, torch.zeros_like(occ_features))
-        else:
-            global_occ_embedding = torch.zeros_like(global_lane_embedding)
-
         agent_norm = self.agent_ln1(agent_embeddings)
         attn_mask = None
         if visible_mask is not None:
@@ -260,7 +225,7 @@ class AgentCentricNet(nn.Module):
         )[0]
         ego_embedding = agent_embeddings[:, :1] + ego_attn_output
         ego_embedding = ego_embedding + self.agent_ffn(self.agent_ln2(ego_embedding))
-        combined = torch.cat((ego_embedding, goal_embeddings, kinematics_embeddings, global_lane_embedding + global_occ_embedding), dim=-1)
+        combined = torch.cat((ego_embedding, goal_embeddings, kinematics_embeddings, global_lane_embedding), dim=-1)
         if self.no_goal_allowed:
             combined = torch.cat((combined, goal_reached), dim=-1)
         context = self.combiner_mlp(combined)
@@ -284,7 +249,6 @@ class AgentCentricBackbone(nn.Module):
         max_agents: int = 16,
         max_lanes: int = 96,
         history_steps: int = 5,
-        enable_occupancy_grid: bool = True,
         no_goal_allowed: bool = True,
         agent_filter_radius: float = 200.0,
         topk_front_weight: float = 10.0,
@@ -307,7 +271,6 @@ class AgentCentricBackbone(nn.Module):
             no_goal_allowed=no_goal_allowed,
             max_agents=max_agents,
             history_steps=history_steps,
-            enable_occupancy_grid=enable_occupancy_grid,
             is_continuous=True,
             use_layer_norm_layout=use_layer_norm_layout,
         )
@@ -359,7 +322,7 @@ class AgentCentricBackbone(nn.Module):
         b, a, h, _ = obs["obj_trajs"].shape
         if b_idx.numel() == 0:
             empty = obs["obj_trajs"].new_zeros(0)
-            return (empty, empty, empty, empty, empty, empty, empty, empty, None), training_mask, (b, a)
+            return (empty, empty, empty, empty, empty, empty, None), training_mask, (b, a)
 
         obj = obs["obj_trajs"].float()
         valid = obs["obj_trajs_mask"].bool()
@@ -397,9 +360,6 @@ class AgentCentricBackbone(nn.Module):
 
         dist = pos_n.norm(dim=-1)
         mask_n = mask_n & (dist <= self.agent_filter_radius)
-        mask_n[:, 0, -1] = True
-        mask_n[:, 0, :-1] = False
-        mask_n[:, 1:, -1] = False
 
         polygons = _vehicle_to_polygon(size_n[..., 0], size_n[..., 1], pos_n, heading_n)
         agent_features = torch.cat((pos_n, vel_n, heading_n.unsqueeze(-1), size_n, polygons.flatten(-2)), dim=-1)
@@ -424,8 +384,6 @@ class AgentCentricBackbone(nn.Module):
 
         lane_features, lane_mask = self._lane_features(obs, b_idx, base_pos, base_heading)
         lane_features, lane_mask = self._select_lanes(lane_features, lane_mask)
-        occ_points = obj.new_full((n, 512, 2), -1.0)
-        occ_mask = torch.zeros(n, 512, dtype=torch.bool, device=obj.device)
 
         agent_features = agent_features * mask_n.unsqueeze(-1).to(agent_features.dtype)
         goal_features = goal_features * mask_n[:, :, -1:].to(goal_features.dtype)
@@ -436,8 +394,6 @@ class AgentCentricBackbone(nn.Module):
             mask_n,
             lane_features,
             lane_mask,
-            occ_points,
-            occ_mask,
             None,
         ), training_mask, (b, a)
 
@@ -468,9 +424,8 @@ class AgentCentricBackbone(nn.Module):
         min_dist = torch.minimum(first_xy.norm(dim=-1), last_xy.norm(dim=-1))
         lane_mask = lane_mask & (min_dist <= self.agent_filter_radius)
 
-        lane_type = _remap_map_type_to_agentcentric(raw_type)
-        speed = torch.zeros_like(lane_type)
-        features = torch.cat((first_xy, last_xy, lane_type, speed), dim=-1)
+        speed = torch.zeros_like(raw_type)
+        features = torch.cat((first_xy, last_xy, raw_type, speed), dim=-1)
         features = features * lane_mask.unsqueeze(-1).to(features.dtype)
         return features, lane_mask
 
