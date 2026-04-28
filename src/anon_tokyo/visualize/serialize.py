@@ -86,6 +86,38 @@ def _valid_lines(polylines: Tensor, mask: Tensor, max_lines: int | None = None) 
     return lines
 
 
+def _preprocessed_map_records(batch: dict[str, Any], sample_idx: int) -> list[dict[str, Any]]:
+    required = (
+        "preprocessed_map_polylines",
+        "preprocessed_map_mask",
+        "preprocessed_map_types",
+        "preprocessed_map_batch_idx",
+        "preprocessed_map_agent_idx",
+        "preprocessed_map_frame",
+    )
+    if not all(key in batch for key in required):
+        return []
+
+    polylines = _cpu(batch["preprocessed_map_polylines"]).float()
+    mask = _cpu(batch["preprocessed_map_mask"]).bool()
+    types = _cpu(batch["preprocessed_map_types"]).float()
+    batch_idx = _cpu(batch["preprocessed_map_batch_idx"]).long()
+    agent_idx = _cpu(batch["preprocessed_map_agent_idx"]).long()
+    frame_idx = _cpu(batch["preprocessed_map_frame"]).long()
+    records = []
+    for row in torch.where(batch_idx == sample_idx)[0].tolist():
+        valid = mask[row].any(dim=-1)
+        lines = [
+            {
+                "type": int(round(float(line_type[point_mask].median().item()))),
+                "points": _as_list(line[point_mask]),
+            }
+            for line, point_mask, line_type in zip(polylines[row, valid], mask[row, valid], types[row, valid], strict=False)
+        ]
+        records.append({"frame": int(frame_idx[row].item()), "agent_id": int(agent_idx[row].item()), "polylines": lines})
+    return records
+
+
 def _agent_type_name(obj_type: int) -> str:
     return {1: "vehicle", 2: "pedestrian", 3: "cyclist"}.get(int(obj_type), "unknown")
 
@@ -355,6 +387,9 @@ def serialize_simulation_batch(
         current_frame = _sample_int(batch, "current_time_index", sample_idx)
         if current_frame is not None:
             scenario["sim_start_frame"] = current_frame + 1
+        preprocessed_map = _preprocessed_map_records(batch, sample_idx)
+        if preprocessed_map:
+            scenario["preprocessed_map"] = preprocessed_map
         if rollout_metric_tensors is not None:
             scenario["metrics"] = serializable_world_metrics(rollout_metric_tensors, sample_idx)
         if rollout_positions is not None:

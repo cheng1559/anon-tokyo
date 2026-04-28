@@ -8,6 +8,12 @@ export interface MapLine {
   points: number[][]
 }
 
+export interface PreprocessedMap {
+  frame: number
+  agent_id: number
+  polylines: MapLine[]
+}
+
 export interface Agent {
   id: number
   type: string
@@ -69,6 +75,7 @@ export interface Scenario {
   goals?: Goal[]
   metrics?: SimulationMetrics
   sim_start_frame?: number
+  preprocessed_map?: PreprocessedMap[]
 }
 
 export interface BatchPayload {

@@ -272,6 +272,62 @@ class WebVisualizerService:
             max_map_lines=512,
         )
 
+    def _agent_centric_preprocessed_map(
+        self,
+        model: torch.nn.Module,
+        obs: dict[str, Any],
+        *,
+        frame_idx: int,
+    ) -> dict[str, torch.Tensor] | None:
+        backbone = getattr(model, "model", model)
+        if not hasattr(backbone, "_features"):
+            return None
+
+        features, training_mask, _ = backbone._features(obs)
+        lane_features = features[4]
+        lane_mask = features[5].bool()
+        b_idx, a_idx = training_mask.bool().nonzero(as_tuple=True)
+        if b_idx.numel() == 0:
+            empty_polylines = lane_features.new_zeros(0, 0, 0, 2)
+            empty_mask = torch.zeros(0, 0, 0, dtype=torch.bool, device=lane_features.device)
+            empty_idx = torch.zeros(0, dtype=torch.long, device=lane_features.device)
+            return {
+                "preprocessed_map_polylines": empty_polylines,
+                "preprocessed_map_mask": empty_mask,
+                "preprocessed_map_types": lane_features.new_zeros(0, 0, 0),
+                "preprocessed_map_batch_idx": empty_idx,
+                "preprocessed_map_agent_idx": empty_idx,
+                "preprocessed_map_frame": empty_idx,
+            }
+
+        obj = obs["obj_trajs"].float()
+        base_vel = obj[..., 8:10][b_idx, a_idx, -1]
+        base_ori = obs["obj_headings"].float()[b_idx, a_idx]
+        vel_yaw = torch.atan2(base_vel[:, 1], base_vel[:, 0])
+        base_heading = torch.where(base_vel.norm(dim=-1) < 0.5, base_ori, vel_yaw)
+        base_pos = obs["obj_positions"].float()[b_idx, a_idx]
+
+        local_polylines = lane_features[..., 0:2]
+        c = base_heading.cos()[:, None, None]
+        s = base_heading.sin()[:, None, None]
+        x = local_polylines[..., 0]
+        y = local_polylines[..., 1]
+        scene_polylines = torch.stack((x * c - y * s, x * s + y * c), dim=-1) + base_pos[:, None, None]
+        return {
+            "preprocessed_map_polylines": scene_polylines.detach(),
+            "preprocessed_map_mask": lane_mask.detach(),
+            "preprocessed_map_types": lane_features[..., 4].detach(),
+            "preprocessed_map_batch_idx": b_idx.detach(),
+            "preprocessed_map_agent_idx": a_idx.detach(),
+            "preprocessed_map_frame": torch.full_like(b_idx, frame_idx),
+        }
+
+    def _concat_preprocessed_maps(self, items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        if not items:
+            return {}
+        keys = items[0].keys()
+        return {key: torch.cat([item[key] for item in items], dim=0) for key in keys}
+
     @torch.no_grad()
     def _predict(self, display_batch: dict[str, Any], inference_batch: dict[str, Any]) -> list[list[dict[str, Any]]] | None:
         model = self._build_model()
@@ -314,12 +370,16 @@ class WebVisualizerService:
             enriched = dict(env.batch)
             enriched["goal_positions"] = env.goal_positions
             return env.log_kinematics["positions"], env.log_kinematics["headings"], env.log_mask, enriched, None, None
+        preprocessed_maps = []
         collision_steps = []
         offroad_steps = []
         goal_reached_steps = []
         reward_steps = []
         value_steps = []
         for _ in range(env.episode_steps):
+            preprocessed = self._agent_centric_preprocessed_map(model, obs, frame_idx=env.start_index + env.step_count + 1)
+            if preprocessed is not None:
+                preprocessed_maps.append(preprocessed)
             action, _, _, value = model(obs, sampling_method="mean")
             obs, reward, _, info = env.step(action)
             assert env.goal_reached is not None
@@ -331,6 +391,7 @@ class WebVisualizerService:
         assert env.positions is not None and env.headings is not None and env.valid is not None and env.batch is not None and env.goal_positions is not None
         enriched = dict(env.batch)
         enriched["goal_positions"] = env.goal_positions
+        enriched.update(self._concat_preprocessed_maps(preprocessed_maps))
         rollout_events = {
             "collision": torch.stack(collision_steps, dim=0),
             "offroad": torch.stack(offroad_steps, dim=0),

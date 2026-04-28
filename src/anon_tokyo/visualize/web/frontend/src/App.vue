@@ -54,6 +54,7 @@ const playing = ref(false)
 const showMap = ref(true)
 const showGroundTruth = ref(true)
 const showPredictions = ref(true)
+const showPreprocessedMap = ref(false)
 const selectedAgentId = ref<number | null>(null)
 const targetAgentsOnly = ref(false)
 const agentSignalTab = ref('reward')
@@ -123,6 +124,7 @@ const metadata = computed(() => {
     return {
         agents: scenario?.agents.length ?? 0,
         map: scenario?.map.length ?? 0,
+        preprocessedMap: scenario?.preprocessed_map?.reduce((total, item) => total + item.polylines.length, 0) ?? 0,
         predictions: scenario?.predictions?.length ?? 0,
         rollout: scenario?.rollout?.length ?? 0
     }
@@ -720,6 +722,11 @@ onBeforeUnmount(() => {
                                     <Label class="block font-medium">Show Prediction / Rollout</Label>
                                     <Switch v-model="showPredictions" class="ml-auto" />
                                 </div>
+                                <div v-if="task === 'simulation'" class="flex items-center gap-2">
+                                    <Icon class="size-5" icon="lucide:scan-line" />
+                                    <Label class="block font-medium">Show Preprocessed Map</Label>
+                                    <Switch v-model="showPreprocessedMap" class="ml-auto" />
+                                </div>
                                 <div class="grid grid-cols-3 gap-3">
                                     <Button class="h-auto cursor-pointer flex-col gap-1" variant="secondary" @click="scenarioCanvas?.zoomIn">
                                         <Icon class="size-5" icon="lucide:zoom-in" />
@@ -760,6 +767,7 @@ onBeforeUnmount(() => {
                             :show-ground-truth="showGroundTruth"
                             :show-map="showMap"
                             :show-predictions="showPredictions"
+                            :show-preprocessed-map="showPreprocessedMap"
                             :target-agents-only="targetAgentsOnly"
                         />
                     </ResizablePanel>
@@ -781,6 +789,10 @@ onBeforeUnmount(() => {
                                     <div class="flex justify-between">
                                         <span class="text-muted-foreground">Map Elements</span>
                                         <span class="font-medium">{{ metadata.map }}</span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span class="text-muted-foreground">Preprocessed Polylines</span>
+                                        <span class="font-medium">{{ metadata.preprocessedMap }}</span>
                                     </div>
                                     <div class="flex justify-between">
                                         <span class="text-muted-foreground">Predictions</span>
@@ -985,6 +997,12 @@ onBeforeUnmount(() => {
                                                     <line class="stroke-foreground" stroke-dasharray="6 6" stroke-linecap="round" stroke-width="3" x1="4" x2="48" y1="8" y2="8" />
                                                 </svg>
                                                 <Label>Dashed Line</Label>
+                                            </div>
+                                            <div class="text-muted-foreground flex items-center gap-2 text-sm">
+                                                <svg class="shrink-0" height="16" viewBox="0 0 52 16" width="52">
+                                                    <line stroke="#06b6d4" stroke-dasharray="2 3" stroke-linecap="round" stroke-width="3" x1="4" x2="48" y1="8" y2="8" />
+                                                </svg>
+                                                <Label>Preprocessed Polyline</Label>
                                             </div>
                                         </div>
                                     </div>

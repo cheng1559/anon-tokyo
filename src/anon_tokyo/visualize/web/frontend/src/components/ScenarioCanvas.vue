@@ -20,6 +20,7 @@ const props = defineProps<{
   showMap: boolean
   showGroundTruth: boolean
   showPredictions: boolean
+  showPreprocessedMap: boolean
   selectedAgentId?: number | null
   targetAgentsOnly?: boolean
 }>()
@@ -55,6 +56,7 @@ function getTheme() {
     mapSolid: dark ? '#e2e8f0' : '#111827',
     mapCurb: '#9370DB',
     mapStop: '#808080',
+    preprocessedMap: '#06b6d4',
     centerline: dark ? '#94a3b8' : '#111827',
     controlled: '#3b82f6',
     sdc: '#f59e0b',
@@ -410,6 +412,18 @@ function drawPredictions(ctx: CanvasRenderingContext2D, scenario: Scenario, them
   })
 }
 
+function drawPreprocessedMap(ctx: CanvasRenderingContext2D, scenario: Scenario, theme: Theme) {
+  if (!props.showPreprocessedMap) return
+  scenario.preprocessed_map
+    ?.filter((record) => record.frame === props.frame && isSelectedAgent(record.agent_id))
+    .forEach((record) => {
+      const selected = props.selectedAgentId === record.agent_id
+      record.polylines.forEach((polyline) => {
+        drawWorldLine(ctx, polyline.points, theme.preprocessedMap, selected ? 2.8 : 2.0, selected ? 0.95 : 0.62, [2, 3])
+      })
+    })
+}
+
 function draw() {
   const ctx = context()
   const canvas = canvasRef.value
@@ -434,6 +448,7 @@ function draw() {
       drawWorldLine(ctx, line.points, style.color, style.width, 0.95, style.dash)
     })
   }
+  drawPreprocessedMap(ctx, scenario, theme)
   if (props.showGroundTruth) {
     scenario.agents
       .filter((agent) => isSelectedAgent(agent.id))
@@ -538,7 +553,19 @@ watch(
     resetView()
   }
 )
-watch(() => [props.frame, props.showMap, props.showGroundTruth, props.showPredictions, props.selectedAgentId, props.targetAgentsOnly, currentThemeId.value], draw)
+watch(
+  () => [
+    props.frame,
+    props.showMap,
+    props.showGroundTruth,
+    props.showPredictions,
+    props.showPreprocessedMap,
+    props.selectedAgentId,
+    props.targetAgentsOnly,
+    currentThemeId.value,
+  ],
+  draw
+)
 
 onMounted(() => {
   window.addEventListener('resize', resize)
