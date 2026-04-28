@@ -22,6 +22,8 @@ app.add_middleware(
 )
 
 app.include_router(rest.router)
+app.include_router(rest.router, prefix="/proxy/{proxy_port}")
+app.include_router(rest.router, prefix="/absproxy/{proxy_port}")
 
 
 @app.exception_handler(Exception)

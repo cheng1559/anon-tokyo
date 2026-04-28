@@ -28,6 +28,8 @@ def _start_frontend(frontend_port: int, backend_port: int, host: str) -> subproc
     frontend_dir = SRC_ROOT / "visualize" / "web" / "frontend"
     env = os.environ.copy()
     env.pop("VITE_BACKEND_URL", None)
+    env["VITE_BACKEND_PORT"] = str(backend_port)
+    env["VITE_FRONTEND_PORT"] = str(frontend_port)
     try:
         return subprocess.Popen(["pnpm", "dev", "--host", "0.0.0.0", "--port", str(frontend_port)], cwd=frontend_dir, env=env)
     except FileNotFoundError:
