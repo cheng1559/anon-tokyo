@@ -24,9 +24,23 @@ spatial interactions.
 ## Preview
 
 <p>
-  <img src="assets/images/screenshot1.png" width="32%" />
-  <img src="assets/images/screenshot2.png" width="32%" />
-  <img src="assets/images/screenshot3.png" width="32%" />
+  <img src="assets/images/screenshot.png" alt="AnonTokyo visualizer screenshot" width="100%" />
+</p>
+
+### Prediction
+
+<p>
+  <img src="assets/images/prediction1.png" alt="Prediction example 1" width="32%" />
+  <img src="assets/images/prediction2.png" alt="Prediction example 2" width="32%" />
+  <img src="assets/images/prediction3.png" alt="Prediction example 3" width="32%" />
+</p>
+
+### Simulation
+
+<p>
+  <img src="assets/images/simulation1.gif" alt="Simulation example 1" width="32%" />
+  <img src="assets/images/simulation2.gif" alt="Simulation example 2" width="32%" />
+  <img src="assets/images/simulation3.gif" alt="Simulation example 3" width="32%" />
 </p>
 
 ## Project Layout
