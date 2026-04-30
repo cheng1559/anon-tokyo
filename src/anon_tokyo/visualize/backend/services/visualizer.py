@@ -370,16 +370,12 @@ class WebVisualizerService:
             enriched = dict(env.batch)
             enriched["goal_positions"] = env.goal_positions
             return env.log_kinematics["positions"], env.log_kinematics["headings"], env.log_mask, enriched, None, None
-        preprocessed_maps = []
         collision_steps = []
         offroad_steps = []
         goal_reached_steps = []
         reward_steps = []
         value_steps = []
         for _ in range(env.episode_steps):
-            preprocessed = self._agent_centric_preprocessed_map(model, obs, frame_idx=env.start_index + env.step_count + 1)
-            if preprocessed is not None:
-                preprocessed_maps.append(preprocessed)
             action, _, _, value = model(obs, sampling_method="mean")
             obs, reward, _, info = env.step(action)
             assert env.goal_reached is not None
@@ -391,7 +387,6 @@ class WebVisualizerService:
         assert env.positions is not None and env.headings is not None and env.valid is not None and env.batch is not None and env.goal_positions is not None
         enriched = dict(env.batch)
         enriched["goal_positions"] = env.goal_positions
-        enriched.update(self._concat_preprocessed_maps(preprocessed_maps))
         rollout_events = {
             "collision": torch.stack(collision_steps, dim=0),
             "offroad": torch.stack(offroad_steps, dim=0),

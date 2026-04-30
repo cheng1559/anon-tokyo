@@ -25,7 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _start_frontend(frontend_port: int, backend_port: int, host: str) -> subprocess.Popen | None:
-    frontend_dir = SRC_ROOT / "visualize" / "web" / "frontend"
+    frontend_dir = SRC_ROOT / "visualize" / "frontend"
     env = os.environ.copy()
     env.pop("VITE_BACKEND_URL", None)
     env["VITE_BACKEND_PORT"] = str(backend_port)
@@ -50,7 +50,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     try:
         uvicorn.run(
-            "anon_tokyo.visualize.web.backend.app:app",
+            "anon_tokyo.visualize.backend.app:app",
             host=host,
             port=args.backend_port,
             reload=args.reload,
